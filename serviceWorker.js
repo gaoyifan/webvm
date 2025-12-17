@@ -13,6 +13,7 @@ async function handleFetch(request) {
 	}
 	catch (e) {
 		console.error(e)
+		throw e;
 	}
 	if (r.status === 0) {
 		return r;
