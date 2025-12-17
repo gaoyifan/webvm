@@ -1,4 +1,12 @@
 async function handleFetch(request) {
+	if (request.url.endsWith("tailscale.wasm") || request.url.endsWith("wasm_exec.js")) {
+		const filename = request.url.split('/').pop();
+		const localUrl = new URL(filename, self.location.origin).href;
+		if (request.url !== localUrl) {
+			return fetch(localUrl);
+		}
+	}
+
 	// Perform the original fetch request and store the result in order to modify the response.
 	try {
 		var r = await fetch(request);
