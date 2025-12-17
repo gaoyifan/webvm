@@ -1,10 +1,17 @@
 async function handleFetch(request) {
-	if (request.url.endsWith("tailscale.wasm") || request.url.endsWith("wasm_exec.js")) {
-		const filename = request.url.split('/').pop();
-		const localUrl = new URL(filename, self.location.origin).href;
-		if (request.url !== localUrl) {
-			return fetch(localUrl);
+	try {
+		const url = new URL(request.url);
+		if (url.pathname.endsWith("/tailscale.wasm") || url.pathname.endsWith("/wasm_exec.js")) {
+			console.log("ServiceWorker: Intercepting request for " + url.pathname);
+			const filename = url.pathname.split('/').pop();
+			const localUrl = new URL(filename, self.location.origin).href;
+			if (request.url !== localUrl) {
+				console.log("ServiceWorker: Redirecting " + request.url + " to " + localUrl);
+				return fetch(localUrl);
+			}
 		}
+	} catch (e) {
+		console.error("ServiceWorker: Error identifying interception target", e);
 	}
 
 	// Perform the original fetch request and store the result in order to modify the response.
