@@ -2,10 +2,14 @@ import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
 
+const terminalConfig = process.env.WEBVM_MODE == "github" ? 'config_github_terminal.js' :
+	process.env.WEBVM_MODE == "cloudflare" ? 'config_cloudflare_terminal.js' :
+	'config_public_terminal.js';
+
 export default defineConfig({
 	resolve: {
 		alias: {
-			'/config_terminal': process.env.WEBVM_MODE == "github" ? 'config_github_terminal.js' : 'config_public_terminal.js',
+			'/config_terminal': terminalConfig,
 			"@leaningtech/cheerpx": process.env.CX_URL ? process.env.CX_URL : "@leaningtech/cheerpx"
 		}
 	},

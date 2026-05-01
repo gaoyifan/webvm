@@ -4,3 +4,7 @@ pnpm-lock.yaml
 build/
 custom-disk-images/*
 !custom-disk-images/.gitkeep
+workers/disk-worker/assets/*
+!workers/disk-worker/assets/.gitkeep
+workers/disk-worker/node_modules/
+workers/disk-worker/.wrangler/
