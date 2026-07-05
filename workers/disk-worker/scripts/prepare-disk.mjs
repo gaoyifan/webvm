@@ -30,13 +30,19 @@ if (!imageName.endsWith(".ext2")) {
 
 const imageDir = path.join(assetsDir, "disks", imageName);
 const chunksDir = path.join(imageDir, "chunks");
-await fs.rm(imageDir, { recursive: true, force: true });
-await fs.mkdir(chunksDir, { recursive: true });
 
 const source = args.input ?? args.sourceUrl;
 const remoteInfo = args.input ? null : await resolveRemoteInfo(args.sourceUrl, args.size ?? process.env.WEBVM_DISK_SIZE);
 const size = args.input ? (await fs.stat(args.input)).size : remoteInfo.size;
 const chunks = Math.ceil(size / CHUNK_SIZE);
+
+if (await isAlreadyPrepared()) {
+	console.log(`${imageName} already prepared (${chunks} chunks); skipping download.`);
+	process.exit(0);
+}
+
+await fs.rm(imageDir, { recursive: true, force: true });
+await fs.mkdir(chunksDir, { recursive: true });
 
 if (args.input) {
 	await splitLocalFile(args.input, chunksDir, size);
@@ -77,6 +83,18 @@ function parseArgs(argv) {
 function inferImageName(value) {
 	const pathname = new URL(value, "file:///").pathname;
 	return path.basename(pathname);
+}
+
+async function isAlreadyPrepared() {
+	const manifest = await fs
+		.readFile(path.join(imageDir, "manifest.json"), "utf8")
+		.then(JSON.parse)
+		.catch(() => null);
+	if (!manifest || manifest.size !== size || manifest.chunkSize !== CHUNK_SIZE || manifest.source !== source) {
+		return false;
+	}
+	const files = await fs.readdir(chunksDir).catch(() => []);
+	return files.filter((name) => name.endsWith(".bin")).length === chunks;
 }
 
 async function splitLocalFile(input, chunksDir, size) {

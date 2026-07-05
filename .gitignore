@@ -8,5 +8,6 @@ workers/disk-worker/assets/*
 !workers/disk-worker/assets/.gitkeep
 workers/disk-worker/node_modules/
 workers/disk-worker/.wrangler/
+workers/disk-worker/.cheerpx-mirror/
 workers/disk-worker/worker-configuration.d.ts
 .playwright-cli/

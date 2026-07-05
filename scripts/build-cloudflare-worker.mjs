@@ -18,7 +18,9 @@ await run("npm", ["run", "build"], {
 	VITE_WEBVM_DISK_IMAGE: diskImageName,
 });
 await fs.cp(path.join(rootDir, "build"), assetsDir, { recursive: true });
+await stripExternalReferences();
 await writeAssetHeaders();
+await run("node", [path.join(rootDir, "scripts", "mirror-cheerpx.mjs")]);
 await run("npm", [
 	"--prefix",
 	workerDir,
@@ -32,9 +34,37 @@ await run("npm", [
 ], diskSize ? { WEBVM_DISK_SIZE: diskSize } : {});
 
 async function resetAssets() {
-	await fs.rm(assetsDir, { recursive: true, force: true });
+	// Clear built frontend files but keep the (large, immutable) disk chunks;
+	// prepare:disk skips chunks that already exist.
 	await fs.mkdir(assetsDir, { recursive: true });
+	for (const entry of await fs.readdir(assetsDir)) {
+		if (entry === "disks") {
+			continue;
+		}
+		await fs.rm(path.join(assetsDir, entry), { recursive: true, force: true });
+	}
 	await fs.writeFile(path.join(assetsDir, ".gitkeep"), "");
+}
+
+/**
+ * The deployed site must be fully self-hosted: strip the analytics script
+ * (it posts to plausible.leaningtech.com) and the Google Fonts preconnect
+ * hints from every built HTML page.
+ */
+async function stripExternalReferences() {
+	for (const entry of await fs.readdir(assetsDir, { recursive: true })) {
+		if (!entry.endsWith(".html")) {
+			continue;
+		}
+		const file = path.join(assetsDir, entry);
+		const html = await fs.readFile(file, "utf8");
+		const stripped = html
+			.replace(/^\s*<script data-domain="webvm\.io"[^>]*><\/script>\n?/m, "")
+			.replace(/^\s*<link rel="preconnect"[^>]*>\n?/gm, "");
+		if (stripped !== html) {
+			await fs.writeFile(file, stripped);
+		}
+	}
 }
 
 async function writeAssetHeaders() {
