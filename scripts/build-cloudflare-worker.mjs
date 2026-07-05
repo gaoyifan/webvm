@@ -18,6 +18,7 @@ await run("npm", ["run", "build"], {
 	VITE_WEBVM_DISK_IMAGE: diskImageName,
 });
 await fs.cp(path.join(rootDir, "build"), assetsDir, { recursive: true });
+await writeAssetHeaders();
 await run("npm", [
 	"--prefix",
 	workerDir,
@@ -34,6 +35,20 @@ async function resetAssets() {
 	await fs.rm(assetsDir, { recursive: true, force: true });
 	await fs.mkdir(assetsDir, { recursive: true });
 	await fs.writeFile(path.join(assetsDir, ".gitkeep"), "");
+}
+
+async function writeAssetHeaders() {
+	// CheerpX needs cross-origin isolation (SharedArrayBuffer). Static assets
+	// are served without invoking the Worker, so the headers must come from
+	// the _headers file.
+	const headers = [
+		"/*",
+		"  Cross-Origin-Embedder-Policy: require-corp",
+		"  Cross-Origin-Opener-Policy: same-origin",
+		"  Cross-Origin-Resource-Policy: cross-origin",
+		"",
+	].join("\n");
+	await fs.writeFile(path.join(assetsDir, "_headers"), headers);
 }
 
 function run(command, args, env = {}) {
