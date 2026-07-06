@@ -6,7 +6,7 @@
 	import '$lib/global.css';
 	import '@xterm/xterm/css/xterm.css'
 	import '@fortawesome/fontawesome-free/css/all.min.css'
-	import { networkInterface, startLogin } from '$lib/network.js'
+	import { networkInterface, startLogin, loadAuthKey, autoConnect } from '$lib/network.js'
 	import { cpuActivity, diskActivity, cpuPercentage, diskLatency } from '$lib/activities.js'
 	import { introMessage, errorMessage, unexpectedErrorMessage } from '$lib/messages.js'
 	import { displayConfig, handleToolImpl } from '$lib/anthropic.js'
@@ -250,6 +250,9 @@
 		// disconnects that CheerpX cannot recover from on its own, and
 		// answers boot-block reads from the bulk prefetch.
 		installDiskSocketReconnect(cacheId);
+		// The engine captures the auth key at Linux.create, so it must be
+		// loaded first (one same-origin fetch, absent outside self-hosting).
+		const authKeyReady = loadAuthKey();
 		const CheerpX = await import('@leaningtech/cheerpx');
 		var blockDevice = null;
 		switch(configObj.diskImageType)
@@ -308,6 +311,7 @@
 			// Convenient access to sample documents in the user directory
 			{type:"dir", dev:documentsDevice, path:"/home/user/documents"}
 		];
+		await authKeyReady;
 		try
 		{
 			cx = await CheerpX.Linux.create({mounts: mountPoints, networkInterface: networkInterface});
@@ -329,6 +333,11 @@
 		{
 			setScreenSize(display);
 			cx.setActivateConsole(handleActivateConsole);
+		}
+		if(networkInterface.authKey)
+		{
+			// Bring the network up in the background while the VM boots.
+			autoConnect(cx).catch((e) => console.warn("tailscale auto-connect failed", e));
 		}
 		// Run the command in a loop, in case the user exits
 		while (true)

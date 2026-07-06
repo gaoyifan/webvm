@@ -141,6 +141,64 @@ profile 与实际读取的偏差长期占用内存；bundle 文件名带时间�
   建、拷贝产物、镜像 CheerpX、准备磁盘块、生成 `_headers`（COOP/COEP，
   SharedArrayBuffer 必需；静态资产不经过 Worker，头必须走 `_headers`）。
 
+## 3.5 网络：Tailscale 自动联网与出口节点
+
+目标：打开页面即自动接入 tailnet 并能直接访问互联网，无需交互登录。
+
+**服务端**（`src/index.ts` + `wrangler.jsonc`）：`/net/tailscale.json` 返回
+`{authKey, exitNodeIp, derpPorts}`。`TS_AUTH_KEY` 是
+Worker secret（Reusable + Ephemeral + tag:webvm 的 tskey），端点与页面同
+样公开——每个访客都成为 tailnet 里一台临时打标节点，泄露面即页面本身，
+轮换 key 即可吊销。其余两项是 vars。
+
+**前端**（`network.js` / `WebVM.svelte` / `net-shim.js` 新增）：
+`loadAuthKey()` 在 `Linux.create` 之前拉取配置（引擎在 create 时快照
+`networkInterface`）；create 后 `autoConnect(cx)` 直接 `networkLogin()`，
+无登录窗口。`net-shim.js` 包一层 `fetch`/`WebSocket` 修两个 wasm 网络
+bug（见下），并把 `exitNodeIp` 发布到 `globalThis.__webvmTsExitNodeIp`。
+
+**关键问题：exit node 的选择与应用。** 调查结论（对 wasm 二进制做字符串
+分析 + Proxy 探针实测 + 官方 CLI 复现）：
+
+- CheerpX 1.1.3 起（tailscale v1.78.3）`ipn.up()` 只读取
+  `controlUrl/hostname/authKey/dnsIp/ipMap`，**`exitNodeIp` 被移除**，只
+  剩引擎内部按 DERP 延迟自动 suggest。在本 tailnet 上（13 个广播
+  0.0.0.0/0 的节点，仅 `do` 真正为 tag:webvm 转发——ACL `via` 限制），
+  自动 suggest 稳定选中不转发的节点（`tailscale exit-node suggest` 同样
+  选 oracle，实测不通），且 netmap 暴露给 JS 的 `exitNode` 标志恒为
+  false，JS 侧无任何改选入口。官方 webvm.io（1.3.5）同样连不通，非本
+  fork 特有。
+- CheerpX 1.1.2 及更早（tailscale v1.76.3）的 `up()` **读取并应用**
+  `exitNodeIp`（等价 `tailscale set --exit-node=<ip>`，控制面已验证该路
+  径可用）。
+
+**方案：钉住旧版 IPN 引擎。** `mirror-cheerpx.mjs` 把
+`tun/tailscale.wasm` 单独钉在 1.1.2（其余运行时保持 1.3.0；两版
+`wasm_exec.js` 字节相同，`ipn.run/tun/up` API 兼容）。28.6 MiB 超过
+Workers 静态资产 25 MiB 单文件上限，故存 gzip（6.2 MiB）、浏览器用
+`DecompressionStream` 解压后实例化——与 boot bundle 同一套做法。
+
+**overrides 机制**（`workers/disk-worker/overrides/`，mirror 脚本在拷贝
+缓存后覆盖）：
+
+- `tailscale_tun.js`：改为加载 `tailscale.wasm.gz`；`newIPN` 改单参数调
+  用（1.1.2 参数不同，两参会 `Usage` fatal 且 exit 1）；显式传入内存
+  stateStorage（1.1.2 默认落 localStorage，CheerpX 的 worker 上下文里不
+  存在，Go 侧直接退出——ephemeral key 每次启动重新注册，状态无需持久）。
+- `tailscale_tun_auto.js`：netmap 到达后优先把
+  `__webvmTsExitNodeIp`（在线校验后）写入 `settings.exitNodeIp` 再次
+  `up()`，不依赖恒为 false 的 `p.exitNode` 标志。
+
+**net-shim 修的两个 wasm URL bug**：DERP WebSocket URL 丢自定义端口
+（`el2-chinanet.gaof.net:10000` 被拨成 443，从 `derpPorts` 补回）；
+netcheck 探测把自定义端口错拼到官方 `*.tailscale.com` 中继上（剥掉非
+443 端口）。
+
+**结果**（无头 Chromium E2E，2026-07-06）：打开页面 → 自动登录 →
+`curl https://ifconfig.me` 返回 `128.199.153.92`（do 的新加坡出口），
+HTTPS 全程 ~3.9 s。页面全程只访问 worker 域名 + Tailscale 基础设施
+（controlplane.tailscale.com、derp3e.tailscale.com），无其他第三方源。
+
 ## 4. 工具与测试
 
 - `test-disk-endpoint.mjs`：协议级回归——WS/HTTP 各类边界（块边界跨越、
@@ -212,6 +270,11 @@ Worker 动态路由、按 `Accept-Encoding` 协商返回 `Content-Encoding: zstd
   存块；CheerpX 升级若改布局，仅退化为「当作全冷、多下一次 bundle」，不
   影响正确性。
 - 未来：bundle 的 zstd 内容编码协商；镜像更新后自动重录/导出 profile。
+- Tailscale IPN 引擎钉在 CheerpX 1.1.2 的 wasm（v1.76.3）：这是最后一个
+  支持 JS 侧指定 `exitNodeIp` 的构建。升级前需确认新版恢复该能力，或改
+  为自编译 tailscale wasm（tsconnect 目标是开源的，但 CheerpX 的
+  tailscale_tun 桥接层是私有 fork，需要复刻）。Tailscale 控制面对
+  v1.76（2024-11）的最低版本支持到期前需处理。
 
 ## 8. 变更文件清单
 
@@ -220,15 +283,18 @@ Worker 动态路由、按 `Accept-Encoding` 协商返回 `Content-Encoding: zstd
 - `workers/disk-worker/`：`src/index.ts`（edge + DO 全部服务端逻辑）、
   `wrangler.jsonc`、`scripts/{prepare-disk,export-boot-profile,replay-boot,test-disk-endpoint}.mjs`、
   `scripts/measure-boot.sh`、`README.md`
+- `workers/disk-worker/overrides/cheerpx/1.3.0/tun/`：
+  `tailscale_tun.js`、`tailscale_tun_auto.js`（镜像时覆盖上游的 fork 补丁）
 - `src/lib/disk-ws-reconnect.js`、`src/lib/disk-boot-prefetch.js`、
-  `src/lib/cheerpx-self-hosted.js`
+  `src/lib/cheerpx-self-hosted.js`、`src/lib/net-shim.js`
 - `scripts/build-cloudflare-worker.mjs`、`scripts/mirror-cheerpx.mjs`
 - `config_cloudflare_terminal.js`
 - `docs/fork-changes.md`（本文档）
 
 修改：
 
-- `src/lib/WebVM.svelte`（安装磁盘 socket 代理）
+- `src/lib/WebVM.svelte`（安装磁盘 socket 代理；Tailscale 自动联网）
+- `src/lib/network.js`（`loadAuthKey`/`autoConnect`；netmap 调试钩子）
 - `vite.config.js`（cloudflare 模式下的 CheerpX 别名）
 - `package.json`（`build:cloudflare-worker` 脚本）
 - `README.md`（Cloudflare 部署章节）
@@ -250,4 +316,9 @@ npx wrangler deploy
 
 # 协议回归
 node scripts/test-disk-endpoint.mjs --url wss://<worker-host>/<image>.ext2 --quick
+
+# Tailscale 自动联网（一次性）：设置 tskey（Reusable+Ephemeral+tag:webvm）
+cd workers/disk-worker && npx wrangler secret put TS_AUTH_KEY
+# 出口节点固定在 wrangler.jsonc vars：TS_EXIT_NODE_IP（须为 ACL 允许
+# tag:webvm 使用、且真实转发的 exit node）
 ```

@@ -42,6 +42,18 @@ export interface Env {
 	// Secret gating the /debug/* endpoints (`wrangler secret put DEBUG_TOKEN`).
 	// Unset = debug endpoints disabled.
 	DEBUG_TOKEN?: string;
+	// Tailscale auth key (`wrangler secret put TS_AUTH_KEY`; reusable +
+	// ephemeral + tagged). Served to the frontend so WebVM joins the tailnet
+	// and gets internet access automatically. Unset = manual login flow.
+	TS_AUTH_KEY?: string;
+	// Preferred exit node (tailnet IP). The tailnet may advertise exit nodes
+	// that do not actually forward traffic for webvm nodes; pin a known-good
+	// one instead of trusting "first online".
+	TS_EXIT_NODE_IP?: string;
+	// JSON map of DERP hostname -> HTTPS port for relays not on 443, e.g.
+	// {"el2-chinanet.gaof.net":10000}. The wasm client drops the custom port
+	// from DERP WebSocket URLs; the frontend shim adds it back from this map.
+	TS_DERP_PORTS?: string;
 }
 
 type DiskManifest = {
@@ -95,6 +107,29 @@ export default {
 				return new Response("Not found", { status: 404 });
 			}
 			return handleDebug(request, env, url);
+		}
+
+		// Tailscale config for the frontend's automatic network setup. As
+		// public as the page itself, by design: every visitor becomes an
+		// ephemeral, tagged tailnet node. Rotate the key to revoke.
+		if (url.pathname === "/net/tailscale.json") {
+			if (!env.TS_AUTH_KEY) {
+				return new Response("Not found", { status: 404 });
+			}
+			let derpPorts: Record<string, number> = {};
+			try {
+				derpPorts = JSON.parse(env.TS_DERP_PORTS ?? "{}");
+			} catch {
+				// Bad var; ship without rewrites rather than break networking.
+			}
+			return Response.json(
+				{
+					authKey: env.TS_AUTH_KEY,
+					exitNodeIp: env.TS_EXIT_NODE_IP,
+					derpPorts,
+				},
+				{ headers: { "Cache-Control": "no-store" } },
+			);
 		}
 
 		const imageName = imageNameFromPath(url.pathname);

@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment'
+import { installNetShims } from '$lib/net-shim.js'
 
 let authKey = undefined;
 let controlUrl = undefined;
@@ -8,6 +9,29 @@ if(browser)
 	let params = new URLSearchParams("?"+window.location.hash.substr(1));
 	authKey = params.get("authKey") || undefined;
 	controlUrl = params.get("controlUrl") || undefined;
+}
+
+// Self-hosted deployments can serve a tailnet config (reusable ephemeral
+// tagged auth key, pinned exit node, DERP port fixes) so networking comes up
+// without any interactive login. The hash parameter still wins, and
+// everything keeps working without the endpoint.
+export async function loadAuthKey()
+{
+	if(!browser)
+		return;
+	try
+	{
+		const response = await fetch("/net/tailscale.json");
+		if(!response.ok)
+			return;
+		const config = await response.json();
+		if(!networkInterface.authKey)
+			networkInterface.authKey = config.authKey || undefined;
+		installNetShims(config);
+	}
+	catch(e)
+	{
+	}
 }
 let dashboardUrl = controlUrl ? null : "https://login.tailscale.com/admin/machines";
 let resolveLogin = null;
@@ -59,6 +83,17 @@ export async function startLogin()
 	const url = await loginPromise;
 	networkData.loginUrl = url;
 	return url;
+}
+
+// Non-interactive connect using the pre-provisioned auth key: no login
+// window, states go DOWNLOADING -> CONNECTED via the engine callbacks. If
+// Tailscale still demands an interactive login (revoked/expired key),
+// loginUrlCb fires as usual and the sidebar button offers the login URL.
+export async function autoConnect(cx)
+{
+	connectionState.set("DOWNLOADING");
+	cx.networkLogin();
+	networkData.loginUrl = await loginPromise;
 }
 
 async function handleCopyIP(event)

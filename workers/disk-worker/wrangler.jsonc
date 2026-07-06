@@ -6,10 +6,11 @@
 	"assets": {
 		"directory": "./assets",
 		"binding": "ASSETS",
-		// Only disk endpoints go through the Worker. Everything else (the WebVM
-		// frontend, disk chunk files) is served directly from static assets,
-		// which is free and does not consume Worker subrequest budget.
-		"run_worker_first": ["/*.ext2", "/debug/*"]
+		// Only disk/config endpoints go through the Worker. Everything else
+		// (the WebVM frontend, disk chunk files) is served directly from
+		// static assets, which is free and does not consume Worker
+		// subrequest budget.
+		"run_worker_first": ["/*.ext2", "/debug/*", "/net/*"]
 	},
 	"durable_objects": {
 		"bindings": [
@@ -23,7 +24,15 @@
 	// (`wrangler secret put DEBUG_TOKEN`) sent as `Authorization: Bearer`.
 	// Without the secret they are disabled.
 	"vars": {
-		"MAX_RANGE_BYTES": "8388608"
+		"MAX_RANGE_BYTES": "8388608",
+		// Tailscale auto-networking (active once the TS_AUTH_KEY secret is
+		// set). TS_EXIT_NODE_IP pins the exit node applied by the (pinned
+		// 1.1.2) Tailscale wasm: the tailnet advertises several exit nodes
+		// that do not forward webvm traffic, so auto-selection is not safe.
+		// TS_DERP_PORTS carries the custom relay port the wasm drops from
+		// DERP WebSocket URLs.
+		"TS_EXIT_NODE_IP": "100.127.101.1",
+		"TS_DERP_PORTS": "{\"el2-chinanet.gaof.net\":10000}"
 	},
 	"observability": {
 		"enabled": true
