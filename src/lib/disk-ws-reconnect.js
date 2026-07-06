@@ -1,28 +1,39 @@
 /**
- * Auto-reconnect for CheerpX CloudDevice disk WebSockets.
+ * Reliability and boot-speed layer for CheerpX CloudDevice disk WebSockets.
  *
- * CheerpX's disk client only recovers from the CloudDevice protocol's 1-byte
- * reconnect signal; it never listens for socket close/error after the initial
- * handshake, so an unexpected disconnect (server deploy, Cloudflare dropping
- * a long-lived connection, network blip) permanently kills the VM's disk.
+ * Auto-reconnect: CheerpX's disk client only recovers from the CloudDevice
+ * protocol's 1-byte reconnect signal; it never listens for socket
+ * close/error after the initial handshake, so an unexpected disconnect
+ * (server deploy, Cloudflare dropping a long-lived connection, network blip)
+ * permanently kills the VM's disk. The proxy installed here masks such
+ * disconnects: it transparently reopens the underlying socket, swallows the
+ * server's fresh metadata handshake, and replays the in-flight block
+ * request. CheerpX sees one uninterrupted socket.
  *
- * This installs a proxy around WebSocket for same-origin `*.ext2` URLs that
- * masks such disconnects: it transparently reopens the underlying socket,
- * swallows the server's fresh metadata handshake, and replays the in-flight
- * block request. CheerpX sees one uninterrupted socket.
+ * Boot prefetch: block reads during boot are answered locally when the
+ * boot-block prefetcher (disk-boot-prefetch.js) has the bytes, replacing
+ * ~150 serial WebSocket round trips with a few parallel bulk fetches.
  *
  * Protocol facts this relies on (see workers/disk-worker/src/index.ts):
  *  - on connect the server always sends one text metadata message first
  *  - the client sends one text range request at a time and expects exactly
  *    one binary response (0-byte = keepalive, 1-byte = reconnect signal)
  */
+import { createBootPrefetcher } from "./disk-boot-prefetch.js";
+
 const RECONNECT_BASE_DELAY_MS = 250;
 const RECONNECT_MAX_DELAY_MS = 5000;
 // Give up masking after ~30 s of failed reconnects and surface the close so
 // CheerpX reports a device error instead of hanging forever.
 const RECONNECT_MAX_ATTEMPTS = 8;
 
-export function installDiskSocketReconnect() {
+// One prefetcher per disk URL, shared across reconnects and CheerpX's own
+// socket replacements.
+const prefetchers = new Map();
+let blockCacheId = null;
+
+export function installDiskSocketReconnect(cacheId) {
+	blockCacheId = cacheId ?? null;
 	const Native = globalThis.WebSocket;
 	if (!Native || Native.__diskReconnectInstalled) {
 		return;
@@ -39,6 +50,15 @@ export function installDiskSocketReconnect() {
 	globalThis.WebSocket = WebSocketProxy;
 }
 
+function prefetcherFor(url) {
+	let prefetcher = prefetchers.get(url);
+	if (!prefetcher) {
+		prefetcher = createBootPrefetcher(url, blockCacheId);
+		prefetchers.set(url, prefetcher);
+	}
+	return prefetcher;
+}
+
 function isDiskUrl(url) {
 	try {
 		return new URL(url, globalThis.location.href).pathname.endsWith(".ext2");
@@ -48,6 +68,7 @@ function isDiskUrl(url) {
 }
 
 function createDiskSocket(Native, url) {
+	const prefetcher = prefetcherFor(url);
 	const facade = {
 		url,
 		bufferedAmount: 0,
@@ -190,10 +211,7 @@ function createDiskSocket(Native, url) {
 		}, delay);
 	}
 
-	facade.send = (data) => {
-		if (clientClosed) {
-			return;
-		}
+	function forward(data) {
 		if (typeof data === "string" && data.length > 0) {
 			inflightRequest = data;
 		}
@@ -206,6 +224,33 @@ function createDiskSocket(Native, url) {
 		}
 		// Requests sent while connecting/handshaking replay via
 		// inflightRequest once the metadata arrives.
+	}
+
+	facade.send = (data) => {
+		if (clientClosed) {
+			return;
+		}
+		const range = typeof data === "string" ? data.match(/^(\d+)-(\d+)$/) : null;
+		if (!range) {
+			forward(data);
+			return;
+		}
+		// Try the boot prefetch first; forward to the server on any miss.
+		// inflightRequest stays unset for local serves so a concurrent
+		// reconnect cannot replay a request CheerpX considers answered.
+		void prefetcher.lookup(Number(range[1]), Number(range[2])).then((bytes) => {
+			if (clientClosed) {
+				return;
+			}
+			if (bytes === null) {
+				forward(data);
+				return;
+			}
+			dispatch(
+				"message",
+				new MessageEvent("message", { data: binaryType === "blob" ? new Blob([bytes]) : bytes }),
+			);
+		});
 	};
 
 	facade.close = (code, reason) => {

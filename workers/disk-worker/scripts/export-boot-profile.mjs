@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
- * Exports the boot profile recorded by a deployed DiskSession Durable Object
- * (requires DEBUG_ENDPOINTS=1) into the local assets directory, so the
- * profile ships with the next deploy and is available in every colo.
+ * Exports the boot profile (first-touch order of 128 KiB blocks) recorded by
+ * a deployed DiskSession Durable Object (requires DEBUG_ENDPOINTS=1) into the
+ * local assets directory as bootblocks.json, so it ships with the next
+ * deploy. The frontend uses it to bulk-load boot blocks missing from the
+ * local cache; the DO uses it to prewarm its chunk cache.
  *
  * Usage:
  *   node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2
@@ -33,8 +35,10 @@ const manifest = JSON.parse(await fs.readFile(path.join(imageDir, "manifest.json
 
 const profile = {
 	imageCreatedAt: manifest.createdAt,
+	imageSize: manifest.size,
 	recordedAt: new Date().toISOString(),
-	chunks: stats.profile,
+	blockSize: 131072,
+	blocks: stats.profile,
 };
-await fs.writeFile(path.join(imageDir, "bootprofile.json"), `${JSON.stringify(profile)}\n`);
-console.log(`Wrote ${stats.profile.length}-chunk boot profile to assets/disks/${image}/bootprofile.json`);
+await fs.writeFile(path.join(imageDir, "bootblocks.json"), `${JSON.stringify(profile)}\n`);
+console.log(`Wrote ${stats.profile.length}-block boot profile to assets/disks/${image}/bootblocks.json`);

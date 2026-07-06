@@ -70,17 +70,23 @@ const CHUNK_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 // Sequential readahead depth (chunks) behind a client read.
 const PREFETCH_CHUNKS = 4;
 
-// Boot profile: cold chunk reads cost 500-900 ms (asset fetch) while warm
-// reads are client RTT, and CheerpX requests blocks serially, so scattered
-// cold reads dominate boot and first-command latency. The read order is
-// deterministic for a given image, so the DO records the first-touch chunk
-// order once and prewarms its cache along that path, staying a bounded
-// window ahead of the client's position in it.
+// Boot profile: the boot read sequence is deterministic for a given image,
+// so the DO records the first-touch order of 128 KiB blocks once. It serves
+// two consumers:
+//  - the frontend fetches it (as the bootblocks.json asset) and bulk-loads
+//    the blocks missing from its local cache in a few parallel HTTP reads,
+//    replacing ~150 serial WebSocket round trips during boot
+//  - the DO prewarms its chunk cache along the derived chunk order, keeping
+//    a bounded window ahead of the client's position, so reads that do go
+//    to the server (no asset shipped yet, prefetch misses) stay RTT-bound
+//    instead of paying the 500-900 ms cold asset fetch
 //
-// The profile ships as a static asset (/disks/<image>/bootprofile.json,
-// exported with scripts/export-boot-profile.mjs) so every colo has it from
-// the start. Without the asset, the DO records the profile from the first
-// session whose reads start at chunk 0 and persists it to DO storage.
+// The profile ships as a static asset (/disks/<image>/bootblocks.json,
+// exported with scripts/export-boot-profile.mjs) so every colo and client
+// has it from the start. Without the asset, the DO records the profile from
+// the first session whose reads start at block 0 and persists it to DO
+// storage.
+const BOOT_BLOCK_BYTES = 128 * 1024;
 const PROFILE_MAX_ENTRIES = 768;
 const PROFILE_PERSIST_EVERY = 16;
 // A recorded profile is worth freezing once it covers a plausible boot set.
@@ -183,16 +189,20 @@ export class DiskSession extends DurableObject<Env> {
 	private manifest?: Promise<DiskManifest>;
 	private imageName?: string;
 	private maxRangeBytes: number;
-	// Boot profile state. `profile` is the recorded first-touch chunk order;
-	// `profileIndex` gives O(1) dedup and position lookup.
+	// Boot profile state. `profile` is the recorded first-touch order of
+	// 128 KiB blocks; `profileIndex` gives O(1) dedup and position lookup.
+	// `chunkOrder` is the derived first-touch chunk order used for prewarm.
 	private profile: number[] = [];
 	private profileIndex = new Map<number, number>();
+	private chunkOrder: number[] = [];
+	private chunkPos = new Map<number, number>();
 	private profileComplete = false;
 	private profileDirty = 0;
 	private profileLoaded?: Promise<void>;
 	private recording = false;
-	// How far into the profile the cache has been prewarmed. In-memory only:
-	// after a hibernation wake-up it is recomputed from the client's position.
+	// How far into the chunk order the cache has been prewarmed. In-memory
+	// only: after a hibernation wake-up it is recomputed from the client's
+	// position.
 	private prewarmPos = 0;
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -249,7 +259,7 @@ export class DiskSession extends DurableObject<Env> {
 			return;
 		}
 
-		this.recordAccess(attachment, Math.floor(range.start / manifest.chunkSize));
+		this.recordAccess(attachment, Math.floor(range.start / BOOT_BLOCK_BYTES));
 		if (attachment.recorder !== before.recorder || attachment.sawFirst !== before.sawFirst) {
 			ws.serializeAttachment(attachment);
 		}
@@ -375,50 +385,61 @@ export class DiskSession extends DurableObject<Env> {
 	private async loadProfileOnce(imageName: string, manifest: DiskManifest): Promise<void> {
 		// Prefer the shipped profile asset: it is available in every colo,
 		// unlike DO storage which is local to the DO that recorded it.
-		const response = await fetchAsset(this.env, `/disks/${imageName}/bootprofile.json`);
+		const response = await fetchAsset(this.env, `/disks/${imageName}/bootblocks.json`);
 		if (response.ok) {
-			const shipped = (await response.json()) as { imageCreatedAt?: string; chunks?: number[] };
-			if (shipped.imageCreatedAt === manifest.createdAt && Array.isArray(shipped.chunks)) {
-				this.adoptProfile(shipped.chunks, true);
+			const shipped = (await response.json()) as { imageCreatedAt?: string; blocks?: number[] };
+			if (shipped.imageCreatedAt === manifest.createdAt && Array.isArray(shipped.blocks)) {
+				this.adoptProfile(shipped.blocks, true, manifest);
 				return;
 			}
 		} else {
 			await response.body?.cancel();
 		}
 
-		const stored = await this.ctx.storage.get<{ chunks: number[]; complete: boolean }>(PROFILE_STORAGE_KEY);
-		if (stored && this.profile.length === 0) {
-			this.adoptProfile(stored.chunks, stored.complete);
+		const stored = await this.ctx.storage.get<{ blocks?: number[]; complete: boolean }>(PROFILE_STORAGE_KEY);
+		if (stored?.blocks && this.profile.length === 0) {
+			this.adoptProfile(stored.blocks, stored.complete, manifest);
 		}
 	}
 
-	private adoptProfile(chunks: number[], complete: boolean): void {
-		this.profile = chunks.slice(0, PROFILE_MAX_ENTRIES);
+	private adoptProfile(blocks: number[], complete: boolean, manifest: DiskManifest): void {
+		this.profile = blocks.slice(0, PROFILE_MAX_ENTRIES);
 		this.profileComplete = complete;
-		this.profileIndex = new Map(this.profile.map((chunk, i) => [chunk, i]));
+		this.profileIndex = new Map(this.profile.map((block, i) => [block, i]));
+		// Derive the first-touch chunk order for cache prewarming.
+		const blocksPerChunk = Math.max(1, Math.floor(manifest.chunkSize / BOOT_BLOCK_BYTES));
+		this.chunkOrder = [];
+		this.chunkPos = new Map();
+		for (const block of this.profile) {
+			const chunkIndex = Math.floor(block / blocksPerChunk);
+			if (!this.chunkPos.has(chunkIndex)) {
+				this.chunkPos.set(chunkIndex, this.chunkOrder.length);
+				this.chunkOrder.push(chunkIndex);
+			}
+		}
 	}
 
-	private recordAccess(attachment: SocketAttachment, chunkIndex: number): void {
+	private recordAccess(attachment: SocketAttachment, blockIndex: number): void {
 		if (this.profileComplete) {
 			return;
 		}
 		if (!attachment.sawFirst) {
 			// Record sessions that replay the boot sequence from the start. An
 			// incomplete profile (an interrupted recording session) is resumed
-			// by any session: the recorded prefix dedupes, new chunks append.
+			// by any session: the recorded prefix dedupes, new blocks append.
 			attachment.sawFirst = true;
-			attachment.recorder = chunkIndex === 0 || this.profile.length > 0;
+			attachment.recorder = blockIndex === 0 || this.profile.length > 0;
 		}
 		if (!attachment.recorder) {
 			return;
 		}
 		this.recording = true;
 
-		if (this.profileIndex.has(chunkIndex)) {
+		if (this.profileIndex.has(blockIndex)) {
 			return;
 		}
-		this.profile.push(chunkIndex);
-		this.profileIndex.set(chunkIndex, this.profile.length - 1);
+		this.profile.push(blockIndex);
+		this.profileIndex.set(blockIndex, this.profile.length - 1);
 		this.profileDirty++;
 		if (this.profile.length >= PROFILE_MAX_ENTRIES) {
 			this.recording = false;
@@ -451,7 +472,7 @@ export class DiskSession extends DurableObject<Env> {
 		}
 		this.profileDirty = 0;
 		void this.ctx.storage
-			.put(PROFILE_STORAGE_KEY, { chunks: this.profile, complete: this.profileComplete })
+			.put(PROFILE_STORAGE_KEY, { blocks: this.profile, complete: this.profileComplete })
 			.catch(() => {});
 	}
 
@@ -460,24 +481,24 @@ export class DiskSession extends DurableObject<Env> {
 	 * bounded window ahead of the client's current position in it.
 	 */
 	private advancePrewarm(manifest: DiskManifest, range: ByteRange): void {
-		const pos = this.profileIndex.get(Math.floor(range.start / manifest.chunkSize));
+		const pos = this.chunkPos.get(Math.floor(range.start / manifest.chunkSize));
 		if (pos === undefined) {
 			return;
 		}
 		if (this.prewarmPos < pos + 1) {
 			this.prewarmPos = pos + 1;
 		}
-		const target = Math.min(pos + PREWARM_LOOKAHEAD_CHUNKS, this.profile.length);
+		const target = Math.min(pos + PREWARM_LOOKAHEAD_CHUNKS, this.chunkOrder.length);
 		if (this.prewarmPos < target) {
 			this.prewarm(PREWARM_PER_MESSAGE, target);
 		}
 	}
 
 	private prewarm(maxReads: number, targetPos?: number): void {
-		const limit = Math.min(targetPos ?? this.prewarmPos + maxReads, this.profile.length);
+		const limit = Math.min(targetPos ?? this.prewarmPos + maxReads, this.chunkOrder.length);
 		let started = 0;
 		while (this.prewarmPos < limit && started < maxReads) {
-			const chunkIndex = this.profile[this.prewarmPos++];
+			const chunkIndex = this.chunkOrder[this.prewarmPos++];
 			if (this.chunkCache.has(chunkIndex)) {
 				continue;
 			}
@@ -507,17 +528,23 @@ export class DiskSession extends DurableObject<Env> {
 	async debugResetProfile(): Promise<void> {
 		this.profile = [];
 		this.profileIndex.clear();
+		this.chunkOrder = [];
+		this.chunkPos.clear();
 		this.profileComplete = false;
 		this.profileDirty = 0;
 		this.recording = false;
 		await this.ctx.storage.delete(PROFILE_STORAGE_KEY);
 	}
 
-	async debugSetProfile(chunks: number[]): Promise<void> {
-		this.adoptProfile(chunks, true);
+	async debugSetProfile(blocks: number[]): Promise<void> {
+		const imageName = this.ctx.id.name?.split("@")[0];
+		if (!imageName) {
+			throw new Error("DO has no named id");
+		}
+		this.adoptProfile(blocks, true, await this.getManifest(imageName));
 		this.recording = false;
 		this.profileDirty = 0;
-		await this.ctx.storage.put(PROFILE_STORAGE_KEY, { chunks: this.profile, complete: true });
+		await this.ctx.storage.put(PROFILE_STORAGE_KEY, { blocks: this.profile, complete: true });
 	}
 
 	async debugColo(): Promise<string> {

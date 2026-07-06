@@ -39,25 +39,35 @@ Workers Static Assets: /disks/<image>.ext2/chunks/000123.bin (1 MiB each)
   unexpected disconnects (deploys, DO migrations, network blips):
   transparently reopens the socket, swallows the fresh metadata handshake,
   and replays the in-flight block request.
+- **Client boot prefetch**: the set of 128 KiB blocks a boot reads is
+  deterministic per image and ships as a static asset (`bootblocks.json`,
+  exported with `scripts/export-boot-profile.mjs`). At startup
+  `src/lib/disk-boot-prefetch.js` subtracts the blocks already in CheerpX's
+  IndexedDB cache and fetches the rest in ~30 coalesced parallel HTTP range
+  requests; the WebSocket proxy answers matching block reads locally. This
+  replaces ~150 serial WebSocket round trips: measured cold boot drops from
+  ~18–20 s to ~5–7 s (time-to-prompt, headless Chromium). Repeat visits skip
+  the bulk fetch entirely (the IndexedDB cache already has the blocks).
 - **Sequential prefetch**: after each block read the DO prefetches the next
   4 chunks into its cache.
-- **Boot-profile prewarm**: cold chunk reads cost 500–900 ms, warm reads are
-  client RTT. The boot read order is deterministic per image, so the DO
-  records the first-touch chunk order once (persisted to DO storage) and
-  prewarms its cache along the profile, staying ≤32 chunks ahead of the
-  client's position. A profile can also be shipped globally as a static
-  asset (`bootprofile.json`, exported with `scripts/export-boot-profile.mjs`),
-  which every colo sees immediately.
+- **Boot-profile prewarm**: cold chunk reads cost 500–900 ms (asset fetch),
+  warm reads are client RTT. The DO derives the first-touch chunk order from
+  the same boot profile and prewarms its cache along it, staying ≤32 chunks
+  ahead of the client's position, so boot reads that do reach the server
+  (no bootblocks asset yet, prefetch misses) stay RTT-bound. Without the
+  shipped asset the DO records the profile from the first session whose
+  reads start at block 0 and persists it to DO storage.
 - **Error handling**: transient asset-read failures retry in-process, then
   fall back to the CloudDevice 1-byte reconnect signal. Malformed requests
   close the socket; reads past EOF are truncated exactly like the reference
-  server at `disks.webvm.io`.
+  server at `disks.webvm.io`. Client-side bulk-fetch failures fall back to
+  ordinary WebSocket reads.
 
 Measured against `wss://disks.webvm.io` from the same host: warm serial
 128 KiB reads p50 ≈ 120 ms vs 73 ms (the NRT→KIX DO hop; colos with local
-DOs stay at the network floor), cold scattered reads ~550 ms vs ~1100 ms,
-boot and `apt list` at parity in paired browser runs. A 96 MiB sequential
-soak sustains 1.2 MiB/s with zero reconnects.
+DOs stay at the network floor), cold scattered reads ~550 ms vs ~1100 ms.
+Boot time-to-prompt ~5–7 s vs ~14 s for webvm.io in the same headless
+browser. A 96 MiB sequential soak sustains 1.2 MiB/s with zero reconnects.
 
 ## CloudDevice protocol
 
@@ -146,8 +156,9 @@ With `DEBUG_ENDPOINTS=1` (see `wrangler.jsonc`), the Worker exposes:
 
 Set `DEBUG_ENDPOINTS` to `"0"` for production.
 
-To ship the currently recorded boot profile as a static asset (available in
-every colo from the first boot):
+To ship the currently recorded boot profile as the `bootblocks.json` asset
+(enables the client boot prefetch and is available in every colo from the
+first boot):
 
 ```sh
 node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2

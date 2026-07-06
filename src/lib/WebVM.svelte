@@ -247,8 +247,9 @@
 	async function initCheerpX()
 	{
 		// Before CheerpX captures WebSocket: masks unexpected disk socket
-		// disconnects that CheerpX cannot recover from on its own.
-		installDiskSocketReconnect();
+		// disconnects that CheerpX cannot recover from on its own, and
+		// answers boot-block reads from the bulk prefetch.
+		installDiskSocketReconnect(cacheId);
 		const CheerpX = await import('@leaningtech/cheerpx');
 		var blockDevice = null;
 		switch(configObj.diskImageType)
