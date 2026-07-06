@@ -40,14 +40,20 @@ Workers Static Assets: /disks/<image>.ext2/chunks/000123.bin (1 MiB each)
   transparently reopens the socket, swallows the fresh metadata handshake,
   and replays the in-flight block request.
 - **Client boot prefetch**: the set of 128 KiB blocks a boot reads is
-  deterministic per image and ships as a static asset (`bootblocks.json`,
-  exported with `scripts/export-boot-profile.mjs`). At startup
+  deterministic per image and ships as a static asset (`bootblocks.json` +
+  gzipped `bootbundle-<ts>.bin.gz`, both exported with
+  `scripts/export-boot-profile.mjs`). At startup
   `src/lib/disk-boot-prefetch.js` subtracts the blocks already in CheerpX's
-  IndexedDB cache and fetches the rest in ~30 coalesced parallel HTTP range
-  requests; the WebSocket proxy answers matching block reads locally. This
-  replaces ~150 serial WebSocket round trips: measured cold boot drops from
-  ~18–20 s to ~5–7 s (time-to-prompt, headless Chromium). Repeat visits skip
-  the bulk fetch entirely (the IndexedDB cache already has the blocks).
+  IndexedDB cache; on a (mostly) cold cache it downloads the bundle — the
+  157 boot blocks concatenated in first-touch order and gzipped, 5.7 MiB
+  instead of 19.6 MiB raw — in one request and inflates it incrementally
+  with `DecompressionStream`, registering each block as its bytes arrive.
+  On a mostly-warm cache it falls back to a few coalesced parallel HTTP
+  range requests for just the missing blocks. The WebSocket proxy answers
+  matching block reads locally. This replaces ~150 serial WebSocket round
+  trips: measured cold boot drops from ~18–20 s to ~4–5 s (time-to-prompt,
+  headless Chromium). Repeat visits skip the bulk fetch entirely (the
+  IndexedDB cache already has the blocks).
 - **Sequential prefetch**: after each block read the DO prefetches the next
   4 chunks into its cache.
 - **Boot-profile prewarm**: cold chunk reads cost 500–900 ms (asset fetch),
@@ -156,9 +162,9 @@ With `DEBUG_ENDPOINTS=1` (see `wrangler.jsonc`), the Worker exposes:
 
 Set `DEBUG_ENDPOINTS` to `"0"` for production.
 
-To ship the currently recorded boot profile as the `bootblocks.json` asset
-(enables the client boot prefetch and is available in every colo from the
-first boot):
+To ship the currently recorded boot profile as static assets
+(`bootblocks.json` + the gzipped boot bundle; enables the client boot
+prefetch and is available in every colo from the first boot):
 
 ```sh
 node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2

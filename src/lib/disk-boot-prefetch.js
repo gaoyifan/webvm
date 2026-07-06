@@ -6,9 +6,17 @@
  * (/disks/<image>/bootblocks.json, see workers/disk-worker). CheerpX reads
  * those blocks one at a time over the WebSocket, so a cold boot pays
  * ~150 serial round trips. This module loads the list at startup, subtracts
- * the blocks already present in CheerpX's IndexedDB block cache, fetches the
- * missing ones in a few parallel coalesced HTTP range requests, and lets the
- * WebSocket proxy (disk-ws-reconnect.js) answer matching block reads locally.
+ * the blocks already present in CheerpX's IndexedDB block cache, bulk-fetches
+ * the missing ones, and lets the WebSocket proxy (disk-ws-reconnect.js)
+ * answer matching block reads locally.
+ *
+ * Two bulk paths, picked by transfer size:
+ *  - mostly-cold cache: one request for the gzipped boot bundle (the blocks
+ *    concatenated in first-touch order, ~29% of raw), inflated incrementally
+ *    with DecompressionStream so each block is served as soon as its bytes
+ *    arrive
+ *  - mostly-warm cache: a few parallel coalesced HTTP range requests for
+ *    just the missing blocks
  *
  * Everything here is best-effort: on any failure lookups return null and the
  * read goes to the server as before.
@@ -49,10 +57,77 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 
 		const cached = await readCachedBlockIndexes(cacheId, profile);
 		const missing = profile.blocks.filter((block) => !cached.has(block)).sort((a, b) => a - b);
-		if (missing.length > 0) {
+		if (missing.length === 0) {
+			return;
+		}
+		// The bundle always transfers all blocks compressed; ranges transfer
+		// only the missing blocks but raw. Pick whichever moves fewer bytes.
+		const bundleUsable =
+			typeof profile.bundle === "string" &&
+			Number.isFinite(profile.bundleBytes) &&
+			typeof DecompressionStream === "function";
+		if (bundleUsable && missing.length * BLOCK_BYTES > profile.bundleBytes) {
+			fetchBundle(profile, missing);
+		} else {
 			fetchMissing(missing);
 		}
 	})().catch(() => {});
+
+	/**
+	 * Downloads the gzipped boot bundle (all profile blocks concatenated in
+	 * list order) and registers blocks incrementally as the stream inflates,
+	 * so early boot reads are served before the download finishes. On any
+	 * failure the still-missing blocks fall back to range requests.
+	 */
+	function fetchBundle(profile, missing) {
+		const resolvers = new Map();
+		for (const block of missing) {
+			let resolve;
+			const settled = new Promise((r) => {
+				resolve = r;
+			});
+			resolvers.set(block, resolve);
+			pending.set(block, settled);
+		}
+		const finishBlock = (block, data) => {
+			const resolve = resolvers.get(block);
+			if (!resolve) {
+				return; // Already cached in IDB; the client never asks for it.
+			}
+			blocks.set(block, data);
+			resolvers.delete(block);
+			pending.delete(block);
+			resolve();
+		};
+
+		(async () => {
+			try {
+				const response = await fetch(`${httpOrigin}/disks/${encodeURIComponent(imageName)}/${profile.bundle}`);
+				if (!response.ok || !response.body) {
+					throw new Error(`no bundle (${response.status})`);
+				}
+				for await (const { block, data } of inflatedBlocks(response.body, profile, imageSize)) {
+					finishBlock(block, data);
+					if (resolvers.size === 0) {
+						break; // Remaining bundle bytes only cover cached blocks.
+					}
+				}
+			} catch {
+				// Fall through: unresolved blocks are refetched below.
+			}
+			const rest = [...resolvers.keys()].sort((a, b) => a - b);
+			if (rest.length > 0) {
+				// Register the range fallback before waking waiters so an
+				// in-flight lookup finds the new pending entry when it
+				// re-checks, instead of missing to the server.
+				fetchMissing(rest);
+			}
+			for (const [block, resolve] of resolvers) {
+				resolvers.delete(block);
+				resolve();
+			}
+		})();
+	}
 
 	function fetchMissing(missing) {
 		for (const range of coalesce(missing)) {
@@ -102,14 +177,20 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 					return null;
 				}
 			}
-			const waits = [];
-			for (let block = firstBlock; block <= lastBlock; block++) {
-				const wait = pending.get(block);
-				if (wait) {
-					waits.push(wait);
+			// Loop: when the bundle download fails mid-boot its blocks are
+			// handed over to freshly registered range fetches, so a settled
+			// wait may leave a block pending again under a new promise.
+			for (;;) {
+				const waits = [];
+				for (let block = firstBlock; block <= lastBlock; block++) {
+					const wait = pending.get(block);
+					if (wait) {
+						waits.push(wait);
+					}
 				}
-			}
-			if (waits.length > 0) {
+				if (waits.length === 0) {
+					break;
+				}
 				await withTimeout(Promise.all(waits), LOOKUP_TIMEOUT_MS);
 			}
 
@@ -144,6 +225,93 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 	}
 
 	return { lookup };
+}
+
+/**
+ * Async generator over a boot-bundle response body: inflates it and yields
+ * `{ block, data }` for every profile block, in bundle (= first-touch) order,
+ * as soon as its bytes are available. A truncated stream simply ends early.
+ */
+async function* inflatedBlocks(body, profile, imageSize) {
+	// Sniff the gzip magic instead of trusting headers: depending on how the
+	// asset host serves .gz files the body may arrive still-compressed or
+	// already inflated by the browser.
+	const { head, stream } = await peekStream(body, 2);
+	if (head.byteLength < 2) {
+		return;
+	}
+	const inflated = head[0] === 0x1f && head[1] === 0x8b ? stream.pipeThrough(new DecompressionStream("gzip")) : stream;
+
+	const reader = inflated.getReader();
+	try {
+		let index = 0;
+		let current = null;
+		let filled = 0;
+		while (index < profile.blocks.length) {
+			const { done, value } = await reader.read();
+			if (done) {
+				return;
+			}
+			let offset = 0;
+			while (offset < value.byteLength && index < profile.blocks.length) {
+				if (!current) {
+					current = new Uint8Array(Math.min(BLOCK_BYTES, imageSize - profile.blocks[index] * BLOCK_BYTES));
+					filled = 0;
+				}
+				const take = Math.min(current.byteLength - filled, value.byteLength - offset);
+				current.set(value.subarray(offset, offset + take), filled);
+				filled += take;
+				offset += take;
+				if (filled === current.byteLength) {
+					yield { block: profile.blocks[index], data: current };
+					current = null;
+					index += 1;
+				}
+			}
+		}
+	} finally {
+		reader.cancel().catch(() => {});
+	}
+}
+
+/** Reads at least `bytes` from a stream, returning them plus an equivalent unconsumed stream. */
+async function peekStream(body, bytes) {
+	const reader = body.getReader();
+	const chunks = [];
+	let total = 0;
+	while (total < bytes) {
+		const { done, value } = await reader.read();
+		if (done) {
+			break;
+		}
+		chunks.push(value);
+		total += value.byteLength;
+	}
+	const head = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		head.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	const stream = new ReadableStream({
+		start(controller) {
+			for (const chunk of chunks) {
+				controller.enqueue(chunk);
+			}
+		},
+		async pull(controller) {
+			const { done, value } = await reader.read();
+			if (done) {
+				controller.close();
+			} else {
+				controller.enqueue(value);
+			}
+		},
+		cancel(reason) {
+			return reader.cancel(reason);
+		},
+	});
+	return { head, stream };
 }
 
 function coalesce(sortedBlocks) {

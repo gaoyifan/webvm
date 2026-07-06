@@ -147,7 +147,10 @@ Then open `http://127.0.0.1:8081` and enjoy your local WebVM!
 This fork includes `workers/disk-worker`, a Cloudflare Worker that serves ext2
 disk byte ranges through `CheerpX.CloudDevice`. It mirrors the official WebVM
 shape: WebVM connects to `wss://<worker-host>/<image>.ext2`, sends text ranges
-such as `0-131071`, and receives binary disk blocks.
+such as `0-131071`, and receives binary disk blocks. See
+[docs/fork-changes.md](docs/fork-changes.md) for a full description of how
+this fork differs from upstream (architecture, reliability, boot
+performance).
 
 For Cloudflare Workers Builds, connect this GitHub repository to the Worker in
 the Cloudflare dashboard and use:

@@ -74,7 +74,8 @@ const PREFETCH_CHUNKS = 4;
 // so the DO records the first-touch order of 128 KiB blocks once. It serves
 // two consumers:
 //  - the frontend fetches it (as the bootblocks.json asset) and bulk-loads
-//    the blocks missing from its local cache in a few parallel HTTP reads,
+//    the blocks missing from its local cache — one gzipped bundle asset on a
+//    cold cache, a few parallel HTTP range reads on a warm-ish one —
 //    replacing ~150 serial WebSocket round trips during boot
 //  - the DO prewarms its chunk cache along the derived chunk order, keeping
 //    a bounded window ahead of the client's position, so reads that do go
