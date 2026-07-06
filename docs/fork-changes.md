@@ -261,7 +261,79 @@ Worker 动态路由、按 `Accept-Encoding` 协商返回 `Content-Encoding: zstd
 预取路径（部分缓存场景）目前未压缩，若要优化可让这些请求改走 Worker
 动态路由做内容编码，当前数据量小（约几百 KiB）未做。
 
-## 7. 已知限制与未来工作
+## 7. 镜像换代：Debian 11/12/13 评估与切换到 bullseye
+
+上游镜像是 Debian 10（buster），已 EOL——`deb.debian.org` 已下架其索引，
+VM 内 `apt update` 直接 404，装不了任何新包。`scripts/build-debian-image.sh`
+用 debootstrap（无需 Docker）构建 i386 ext2 镜像（bullseye/bookworm/trixie
+任选），包集合对齐上游 `dockerfiles/debian_large`。构建要点：
+
+- `mke2fs -E revision=0 -d <rootfs>` 用户态填充：内核挂载拷贝会因新版
+  Debian 自带的文件 capabilities（如 ping）写入 xattr，把文件系统悄悄
+  升级到 revision 1 + ext_attr，CheerpX 的 ext2 驱动直接拒载；
+- 镜像内 `/dev` 清空成与上游一致的形态（仅 `pts`/`shm` 空目录 +
+  空 `console` 文件）：镜像里真实的字符设备节点会遮蔽 CheerpX 的虚拟
+  `/dev`，打开即永久阻塞（`su`/`sudo` 在 `/dev/tty` 上挂死的原因之一）；
+- 排除 exim4/bsd-mailx（MTA 死重 + postinst 在 chroot 里失败）；
+- buster 之后的原生 `su`/`sudo` 在 CheerpX 下都挂死（libxcrypt crypt()
+  初始化不返回），镜像自带 `/usr/local/bin/sudo` setuid wrapper（PATH
+  优先遮蔽原生 sudo，直接 setuid+exec，等价单用户 VM 的 NOPASSWD sudo）。
+
+**结论：13/12 均被 CheerpX 1.3.0 的 i386 仿真 bug 挡住，11（bullseye）
+全部功能可用，已切为默认镜像**（`debian_bullseye_20260706_1.ext2`）。
+三个候选镜像的块与 boot bundle 均已上传，设 `WEBVM_DISK_IMAGE` 重建即可
+互相切换。
+
+同环境实测对比（2026-07-06，冷启动均为清空 IDB + HTTP 缓存后带 bundle）：
+
+| | buster（原默认） | bullseye（新默认） | bookworm | trixie |
+| --- | --- | --- | --- | --- |
+| Debian / 支持期 | 10，EOL 2024 | 11，LTS 至 2026-08 | 12，LTS 至 2028-06 | 13，安全支持至 2028 |
+| 镜像大小 | 2.0 GB / 1908 块 | 2.4 GB / 2289 块 | 同左 | 同左 |
+| boot bundle | 5.7 MiB / 157 块 | 4.2 MiB / 112 块 | —（未录制） | 5.3 MiB / 152 块 |
+| 冷启动到提示符 | 3.7–4.4 s | 3.6–4.0 s | —（~28 s 无 bundle） | 3.9 s |
+| `apt update` | ✗（EOL，404） | ✓ | ✗ **挂死** | ✓ |
+| `apt install` | ✗ | ✓（装 sl 实测） | ✗ | ✓（7.8 s 冷 `apt`） |
+| python3 | 3.7（✓） | 3.9（✓，含 os.urandom） | 3.11：**退出时故障** | 3.13：**启动即挂** |
+| gcc / node | 8.3 / 10.24（✓） | 10.2 / 12.22（✓） | 12.2 / 18.20（✓） | 14.2 / 20.19（✓） |
+| sudo | ✓ | wrapper ✓（原生挂） | wrapper ✓（原生挂） | wrapper ✓（原生挂） |
+
+bullseye 的取舍：所有功能今天都可用，但 LTS 到 2026-08-31 结束（i386 在
+支持架构内），之后 `deb.debian.org` 会像 buster 一样下架索引，apt 再次
+失效（届时可把 sources.list 指到 archive.debian.org 继续装旧包）。
+bookworm 的 LTS 到 2028 年中且支持 i386，是理想目标，但见下文仿真 bug。
+
+CheerpX 兼容性问题（版本越新触雷越多，buster/bullseye 不触）：
+
+- **python3.13 致命（trixie）**：任何实际执行（`python3 -c 'print(1)'`
+  即可复现）陷入不可中断的死循环并拖死整个 VM。浏览器控制台可见故障日志
+  `Fault addr 0x13d4a, ip 0x8170491, proc /usr/bin/python3`——libpython
+  内部（`PyDict_Contains` 之后的内部函数）拿着近空指针访存，属指令级
+  仿真错误，1.3.0 与 1.3.5 均复现。`python3 --version`（早退路径）正常。
+- **python3.11 退出故障（bookworm）**：脚本能执行并输出（os.urandom 也
+  正常），但解释器退出阶段触发同类故障
+  （`Fault addr 0x23dc0, ip 0x8295fb6, proc /usr/bin/python3`），进程
+  不返回、shell 拿不到退出码，VM 随之卡死——实际不可用。
+- **apt update 挂死（bookworm）**：网络本身通（curl 正常），http worker
+  子进程启动后（`Starting method '/usr/lib/apt/methods/http'` 已打印）
+  无任何进展，强制 IPv4 无效。bullseye/trixie 的 apt 同路径正常。
+- **libxcrypt 挂死（bullseye/bookworm/trixie）**：crypt() 初始化在仿真下
+  不返回，PAM 因此拖死 `su`/`sudo`/`passwd`；用镜像内 setuid wrapper
+  绕过（见上）。
+- **getrandom() 挂死（1.3.0 × trixie glibc 2.41）**：trixie 的 glibc
+  getrandom 路径在 1.3.0 下不返回（python `os.urandom`、libxcrypt 熵
+  初始化挂死）；buster（2.28）/bullseye（2.31）在同一运行时上正常
+  （实测即时返回真实字节）。1.3.5 对 trixie 也已修复（实测 n=16）。
+- **CheerpX 1.3.5 不可用**：曾试升级到 1.3.5 换 getrandom 修复，但其
+  futex 处理让 dpkg-deb 的子进程全部报
+  `The futex facility returned an unexpected error code`，`apt install`
+  在任何镜像上都会失败；且 python3.13 依旧挂。故运行时保持 1.3.0
+  （见 `scripts/mirror-cheerpx.mjs` 的版本注释）。
+
+升级到 bookworm/trixie 的前提是 CheerpX 修复上述仿真 bug（闭源，无法
+自行修）；届时用构建脚本重建即可。
+
+## 8. 已知限制与未来工作
 
 - DO 不驻留的 colo 有一跳骨干网延迟（`apt` 慢 ~2.7 s）；无法在免费套餐
   内消除，可观察 Cloudflare 扩 DO colo 覆盖。
@@ -276,7 +348,7 @@ Worker 动态路由、按 `Accept-Encoding` 协商返回 `Content-Encoding: zstd
   tailscale_tun 桥接层是私有 fork，需要复刻）。Tailscale 控制面对
   v1.76（2024-11）的最低版本支持到期前需处理。
 
-## 8. 变更文件清单
+## 9. 变更文件清单
 
 新增：
 
@@ -288,19 +360,20 @@ Worker 动态路由、按 `Accept-Encoding` 协商返回 `Content-Encoding: zstd
 - `src/lib/disk-ws-reconnect.js`、`src/lib/disk-boot-prefetch.js`、
   `src/lib/cheerpx-self-hosted.js`、`src/lib/net-shim.js`
 - `scripts/build-cloudflare-worker.mjs`、`scripts/mirror-cheerpx.mjs`
+- `scripts/build-debian-image.sh`（bullseye/bookworm/trixie 镜像构建，见 §7）
 - `config_cloudflare_terminal.js`
 - `docs/fork-changes.md`（本文档）
 
 修改：
 
 - `src/lib/WebVM.svelte`（安装磁盘 socket 代理；Tailscale 自动联网）
-- `src/lib/network.js`（`loadAuthKey`/`autoConnect`；netmap 调试钩子）
+- `src/lib/network.js`（`loadAuthKey`/`autoConnect`）
 - `vite.config.js`（cloudflare 模式下的 CheerpX 别名）
 - `package.json`（`build:cloudflare-worker` 脚本）
 - `README.md`（Cloudflare 部署章节）
 - `.gitignore`（资产、镜像缓存等）
 
-## 9. 运维速查
+## 10. 运维速查
 
 ```sh
 # 全量构建（前端 + CheerpX 镜像 + 磁盘块）并部署

@@ -8,8 +8,12 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const workerDir = path.join(rootDir, "workers", "disk-worker");
 const assetsDir = path.join(workerDir, "assets");
 
-const diskImageName = process.env.WEBVM_DISK_IMAGE || "debian_large_20230522_5044875331_2.ext2";
-const diskSourceUrl = process.env.WEBVM_DISK_SOURCE_URL || `wss://disks.webvm.io/${diskImageName}`;
+// Locally built bullseye image (scripts/build-debian-image.sh); for images
+// not yet chunked into assets/, point WEBVM_DISK_SOURCE_URL at the .ext2.
+const diskImageName = process.env.WEBVM_DISK_IMAGE || "debian_bullseye_20260706_1.ext2";
+// Either a wss/https CloudDevice endpoint or a local .ext2 file path.
+const diskSource = process.env.WEBVM_DISK_SOURCE_URL || `wss://disks.webvm.io/${diskImageName}`;
+const diskSourceIsLocal = !/^(https|wss):/.test(diskSource);
 const diskSize = process.env.WEBVM_DISK_SIZE;
 
 await resetAssets();
@@ -27,8 +31,8 @@ await run("npm", [
 	"run",
 	"prepare:disk",
 	"--",
-	"--source-url",
-	diskSourceUrl,
+	diskSourceIsLocal ? "--input" : "--source-url",
+	diskSource,
 	"--name",
 	diskImageName,
 ], diskSize ? { WEBVM_DISK_SIZE: diskSize } : {});

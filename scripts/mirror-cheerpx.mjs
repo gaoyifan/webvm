@@ -14,6 +14,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
+// 1.3.0 is the newest runtime that can run dpkg/apt: 1.3.5's futex handling
+// breaks the child processes dpkg-deb spawns ("The futex facility returned
+// an unexpected error code"), making `apt install` fail on any image. The
+// trade-off: 1.3.5 fixes the getrandom() hang that trixie's glibc 2.41
+// triggers on 1.3.0 (buster's glibc 2.28 getrandom works fine on both).
 const CHEERPX_VERSION = "1.3.0";
 const UPSTREAM = `https://cxrtnc.leaningtech.com/${CHEERPX_VERSION}`;
 

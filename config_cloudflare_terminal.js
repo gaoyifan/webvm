@@ -1,4 +1,4 @@
-const diskImageName = import.meta.env.VITE_WEBVM_DISK_IMAGE || "debian_large_20230522_5044875331_2.ext2";
+const diskImageName = import.meta.env.VITE_WEBVM_DISK_IMAGE || "debian_bullseye_20260706_1.ext2";
 const defaultDiskImagePath = `/${diskImageName}`;
 const defaultDiskImageUrl = typeof location === "undefined" ? defaultDiskImagePath :
 	`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${defaultDiskImagePath}`;

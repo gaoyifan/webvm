@@ -32,14 +32,17 @@ const imageDir = path.join(assetsDir, "disks", imageName);
 const chunksDir = path.join(imageDir, "chunks");
 
 const source = args.input ?? args.sourceUrl;
+
+// The existing manifest is the source of truth for an already-chunked image:
+// skip before touching the source at all (locally built images have no
+// remote endpoint to query). Delete the image dir to force a re-chunk.
+if (await isAlreadyPrepared()) {
+	process.exit(0);
+}
+
 const remoteInfo = args.input ? null : await resolveRemoteInfo(args.sourceUrl, args.size ?? process.env.WEBVM_DISK_SIZE);
 const size = args.input ? (await fs.stat(args.input)).size : remoteInfo.size;
 const chunks = Math.ceil(size / CHUNK_SIZE);
-
-if (await isAlreadyPrepared()) {
-	console.log(`${imageName} already prepared (${chunks} chunks); skipping download.`);
-	process.exit(0);
-}
 
 await fs.rm(imageDir, { recursive: true, force: true });
 await fs.mkdir(chunksDir, { recursive: true });
@@ -90,11 +93,15 @@ async function isAlreadyPrepared() {
 		.readFile(path.join(imageDir, "manifest.json"), "utf8")
 		.then(JSON.parse)
 		.catch(() => null);
-	if (!manifest || manifest.size !== size || manifest.chunkSize !== CHUNK_SIZE || manifest.source !== source) {
+	if (!manifest || manifest.chunkSize !== CHUNK_SIZE) {
 		return false;
 	}
 	const files = await fs.readdir(chunksDir).catch(() => []);
-	return files.filter((name) => name.endsWith(".bin")).length === chunks;
+	if (files.filter((name) => name.endsWith(".bin")).length !== manifest.chunks) {
+		return false;
+	}
+	console.log(`${imageName} already prepared (${manifest.chunks} chunks); skipping.`);
+	return true;
 }
 
 async function splitLocalFile(input, chunksDir, size) {

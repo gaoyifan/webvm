@@ -40,7 +40,7 @@ export async function init() {
 		let {instance} = await WebAssembly.instantiate(bytes, go.importObject);
 		go.run(instance);
 
-		// The 1.1.2 newIPN takes a single options argument (unlike 1.3.0's
+		// The 1.1.2 newIPN takes a single options argument (unlike 1.3.x's
 		// (conf, options)); the conf is consumed by ipn.up() instead. The
 		// 1.1.2 default state store is localStorage, which does not exist in
 		// the CheerpX worker context (the Go side exits with code 1), so an
