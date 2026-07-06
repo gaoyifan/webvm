@@ -11,6 +11,7 @@
 	import { introMessage, errorMessage, unexpectedErrorMessage } from '$lib/messages.js'
 	import { displayConfig, handleToolImpl } from '$lib/anthropic.js'
 	import { tryPlausible } from '$lib/plausible.js'
+	import { installDiskSocketReconnect } from '$lib/disk-ws-reconnect.js'
 
 	export let configObj = null;
 	export let processCallback = null;
@@ -245,6 +246,9 @@
 	}
 	async function initCheerpX()
 	{
+		// Before CheerpX captures WebSocket: masks unexpected disk socket
+		// disconnects that CheerpX cannot recover from on its own.
+		installDiskSocketReconnect();
 		const CheerpX = await import('@leaningtech/cheerpx');
 		var blockDevice = null;
 		switch(configObj.diskImageType)

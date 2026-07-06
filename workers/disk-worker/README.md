@@ -7,56 +7,57 @@ fallback. It also serves the WebVM frontend itself from Workers Static Assets.
 ## Architecture
 
 ```text
-Browser (CheerpX CloudDevice)
+Browser (CheerpX CloudDevice, wrapped by src/lib/disk-ws-reconnect.js)
   │  wss://<worker-host>/<image>.ext2
   ▼
-Edge Worker ── terminates the client WebSocket in the user's colo
-  │            serves blocks from an isolate-wide chunk LRU (64 MiB)
-  │            also answers the HTTP fallback (?s=&e=, Range) directly
-  │  one internal WebSocket per session (cache misses only)
+Edge Worker ── forwards the WebSocket upgrade to the Durable Object
+  │            answers the HTTP fallback (?s=&e=, Range) per-request
   ▼
 DiskSession Durable Object (one per image per colo)
-  │            second-level chunk LRU (64 MiB) + boot profile
-  │  WebSocket Hibernation API (fresh subrequest budget per message)
+  │            terminates the client WebSocket (Hibernation API)
+  │            chunk LRU (64 MiB) + boot-profile prewarm + prefetch
+  │  fresh subrequest budget per message
   ▼
 Workers Static Assets: /disks/<image>.ext2/chunks/000123.bin (1 MiB each)
 ```
 
 - **Disk storage**: the image is split into 1 MiB chunk files uploaded as
   Workers Static Assets (free storage/reads, edge-cached, 20k/100k file limit).
-- **Edge termination**: the client socket terminates in the edge Worker, so
-  warm block reads are answered at the pure network floor. Durable Objects do
-  not run in every colo (an NRT client gets a KIX DO, ~+13 ms per read, which
-  is the difference to the reference server on `apt`-style serial workloads).
-- **Internal chunk link**: on a cache miss the edge fetches the whole 1 MiB
-  chunk from the DO over a single internal WebSocket (`chunk:<index>` →
-  `chunk:<index>:<len>` + ≤512 KiB binary frames). The link costs one
-  subrequest for the whole session, so the edge Worker's 50-subrequest budget
-  is never exhausted, and the client never sees a reconnect.
-- **Why a DO behind the edge**: asset reads must happen somewhere with a
-  renewable budget. With WebSocket Hibernation each incoming message is its
-  own invocation with fresh limits, so the DO can serve any number of chunk
-  fetches over one link. Its cache also survives edge isolate turnover and is
-  shared by all sessions in the colo.
-- **Sequential prefetch**: after each block read the edge prefetches the next
-  4 chunks through the same link.
+- **DO termination**: eyeball WebSockets held by stateless Worker invocations
+  have no lifetime guarantee — the runtime load-sheds them after minutes
+  (observed as `loadShed` invocation outcomes killing live sessions), and
+  CheerpX cannot recover from an unexpected close. Hibernatable DO sockets
+  are the supported long-lived pattern: the DO may be evicted while the
+  socket stays connected, and each message wakes it with a fresh subrequest
+  budget, so asset reads never exhaust the 50-subrequest budget a single
+  edge invocation would get. The DO is keyed by image + edge colo, placing
+  it in (or near) the caller's colo; where DOs don't run (e.g. NRT → KIX)
+  warm reads pay a small backbone hop.
+- **Client reconnect wrapper**: `src/lib/disk-ws-reconnect.js` proxies the
+  disk WebSocket in the frontend. CheerpX only recovers from the protocol's
+  1-byte reconnect signal, never from a socket death, so the wrapper masks
+  unexpected disconnects (deploys, DO migrations, network blips):
+  transparently reopens the socket, swallows the fresh metadata handshake,
+  and replays the in-flight block request.
+- **Sequential prefetch**: after each block read the DO prefetches the next
+  4 chunks into its cache.
 - **Boot-profile prewarm**: cold chunk reads cost 500–900 ms, warm reads are
-  client RTT (~75 ms). The boot read order is deterministic per image, so the
-  DO records the first-touch chunk order once (persisted to DO storage) and
-  sends it to the edge on link connect; the edge prewarms its cache along the
-  profile, staying ≤32 chunks ahead of the client's position. A profile can
-  also be shipped globally as a static asset (`bootprofile.json`, exported
-  with `scripts/export-boot-profile.mjs`), which every colo sees immediately.
-- **Error handling**: transient asset-read failures retry in-process, the
-  edge retries a dead link once with a fresh one, then falls back to the
-  CloudDevice 1-byte reconnect signal. Malformed requests close the socket;
-  reads past EOF are truncated exactly like the reference server at
-  `disks.webvm.io`.
+  client RTT. The boot read order is deterministic per image, so the DO
+  records the first-touch chunk order once (persisted to DO storage) and
+  prewarms its cache along the profile, staying ≤32 chunks ahead of the
+  client's position. A profile can also be shipped globally as a static
+  asset (`bootprofile.json`, exported with `scripts/export-boot-profile.mjs`),
+  which every colo sees immediately.
+- **Error handling**: transient asset-read failures retry in-process, then
+  fall back to the CloudDevice 1-byte reconnect signal. Malformed requests
+  close the socket; reads past EOF are truncated exactly like the reference
+  server at `disks.webvm.io`.
 
 Measured against `wss://disks.webvm.io` from the same host: warm serial
-128 KiB reads p50 ≈ 74 ms vs 73 ms (was ~87 ms with the client socket
-terminating in the DO), cold scattered reads ~550 ms vs ~1100 ms, boot and
-`apt list` at parity in paired browser runs.
+128 KiB reads p50 ≈ 120 ms vs 73 ms (the NRT→KIX DO hop; colos with local
+DOs stay at the network floor), cold scattered reads ~550 ms vs ~1100 ms,
+boot and `apt list` at parity in paired browser runs. A 96 MiB sequential
+soak sustains 1.2 MiB/s with zero reconnects.
 
 ## CloudDevice protocol
 
@@ -141,11 +142,7 @@ With `DEBUG_ENDPOINTS=1` (see `wrangler.jsonc`), the Worker exposes:
 - `GET /debug/session?image=<image>` – DO cache/profile stats
 - `GET /debug/session?image=<image>&resetProfile` – clear the boot profile
 - `POST /debug/session?image=<image>&setProfile` (JSON array of chunk indexes)
-- `GET /debug/chunklink?start=<chunk>&n=<count>&c=<concurrency>` – exercise
-  the internal edge→DO chunk link and report per-chunk timings
 - `GET /debug/where` – edge colo vs DO colo and RPC latency
-- `GET /debug/subrequests?n=<count>` – measure the per-invocation subrequest
-  budget empirically
 
 Set `DEBUG_ENDPOINTS` to `"0"` for production.
 
