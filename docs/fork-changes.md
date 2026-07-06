@@ -20,7 +20,7 @@ Cloudflare Worker 上自托管：浏览器只访问
 浏览器
  ├─ WebVM 前端（Workers Static Assets，本域名）
  ├─ CheerpX 运行时（镜像到 /cheerpx/<version>/，本域名）
- ├─ 启动块批量预取（bootblocks.json + bootbundle-<ts>.bin.gz，本域名）
+ ├─ 启动块批量预取（bootblocks.json + bundles/bootbundle-<ts>.bin.gz，本域名）
  └─ CheerpX CloudDevice WebSocket（wss://<host>/<image>.ext2）
       │ 由 src/lib/disk-ws-reconnect.js 代理：断线重连 + 本地应答预取块
       ▼
@@ -29,7 +29,7 @@ Cloudflare Worker 上自托管：浏览器只访问
       ▼
  DiskSession Durable Object（每镜像 × 每 colo 一个实例）
       │ Hibernation API 终结客户端 WebSocket
-      │ 64 MiB chunk LRU + 启动 profile 预热 + 顺序预取
+      │ 64 MiB chunk LRU + 顺序预取
       ▼
  Workers Static Assets：/disks/<image>/chunks/000123.bin（1 MiB / 块）
 ```
@@ -69,18 +69,20 @@ range 回退（`?s=&e=` 或 `Range` 头，语义与官方服务器一致，200 +
   跳骨干网延迟。
 - **chunk LRU 缓存**：64 MiB 内存缓存，避免重复读资产（冷资产读
   500–900 ms，热读是 RTT 级）。
-- **启动 profile**：启动读序列对固定镜像是确定的。DO 以 128 KiB 块粒度
-  记录首次触达顺序（首个从块 0 开始读的会话触发记录，写入 DO storage，
-  也可从 `bootblocks.json` 资产直接加载）。用途有二：客户端批量预取
-  （见 §3.2）；DO 端沿 profile 派生的 chunk 顺序预热缓存，保持领先客户
-  端 ≤32 chunk，使真正到达服务端的启动读保持 RTT 级。
+- **启动 profile 录制**：启动读序列对固定镜像是确定的。DO 以 128 KiB 块
+  粒度记录首次触达顺序（首个从块 0 开始读的会话触发记录，写入 DO
+  storage），`export-boot-profile.mjs` 把录制结果导出为客户端批量预取用
+  的静态资产（见 §3.2）。早期版本还让 DO 沿 profile 预热自己的 chunk
+  缓存；bundle 上线后启动读几乎不再到达服务端，该 prewarm 已删除以简化
+  实现。
 - **顺序预取**：每次响应后向前预取 4 个 chunk。
 - **错误处理**：资产读瞬时失败先进程内重试，再退化为 CloudDevice 协议
   的 1 字节重连信号；格式错误的请求关闭 socket；越过 EOF 截断，与官方
   服务器逐字节一致。
-- **调试端点**（`DEBUG_ENDPOINTS=1` 时）：`/debug/session`（缓存/profile
-  统计、重置/注入 profile）、`/debug/where`（edge colo vs DO colo 与 RPC
-  延迟）。
+- **调试端点**：需要 `DEBUG_TOKEN` secret（`wrangler secret put`，以
+  `Authorization: Bearer` 携带），未设置 secret 时整体关闭。
+  `/debug/session`（缓存/profile 统计、重置/注入 profile）、
+  `/debug/where`（edge colo vs DO colo 与 RPC 延迟）。
 
 ### 2.4 CloudDevice 协议实现
 
@@ -107,10 +109,10 @@ CheerpX 暴露 close。同时它是启动预取的挂载点：每个 `<start>-<e
 据）；打开 CheerpX 的 IndexedDB 块缓存（`cjFS_/<cacheId>/`），校验 meta
 文件与当前镜像一致后枚举已有块；计算缺失集合。然后二选一：
 
-- **基本全缺（冷启动）**：单请求下载 `bootbundle-<ts>.bin.gz` —— 157 个
-  块按首次触达顺序拼接后 gzip，19.6 MiB → 5.7 MiB。用浏览器原生
-  `DecompressionStream("gzip")` 边下边解，每个块字节一到就可被 WS 代理
-  本地应答（bundle 顺序即启动读取顺序，所以流式解压天然「先到先用」）。
+- **基本全缺（冷启动）**：单请求下载 `bundles/bootbundle-<ts>.bin.gz`
+  —— 157 个块按首次触达顺序拼接后 gzip，19.6 MiB → 5.7 MiB。用浏览器原
+  生 `DecompressionStream("gzip")` 边下边解，每个块字节一到就可被 WS 代
+  理本地应答（bundle 顺序即启动读取顺序，所以流式解压天然「先到先用」）。
   选择依据是字节数比较：`缺失块数 × 128 KiB > bundle 压缩后大小` 时用
   bundle。
 - **大部分已缓存**：只对缺失块发少量合并的并行 HTTP range 请求（间隙
@@ -118,8 +120,11 @@ CheerpX 暴露 close。同时它是启动预取的挂载点：每个 `<start>-<e
 
 全程 best-effort：bundle 404/截断/解压失败都会把剩余块转交 range 路径，
 range 再失败则回落到原始 WebSocket 逐块读，只影响速度不影响正确性。
-bundle 文件名带时间戳版本号，杜绝「新列表配旧 bundle」的错配（错配只会
-404 然后走回退）。
+健壮性细节：等待批量数据的读请求按「下载停滞 15 s」而非总时长判定回退，
+慢而未断的链路不会中途放弃；批量取完 2 分钟后释放未被读取的块，避免
+profile 与实际读取的偏差长期占用内存；bundle 文件名带时间戳版本号并放
+在 `bundles/` 目录（immutable 缓存头），「新列表配旧 bundle」的错配只会
+404 然后走回退。
 
 ### 3.3 其他前端改动
 
@@ -158,11 +163,11 @@ bundle 文件名带时间戳版本号，杜绝「新列表配旧 bundle」的错
 | 官方 webvm.io（对照） | ~14 s | ~157 次串行 WS | ~19.6 MiB |
 | fork：纯 WS 逐块（初版） | ~19 s | ~157 次串行 WS | ~19.6 MiB |
 | fork：range 并行预取 | ~6 s | 31 次 HTTP | 20.8 MiB |
-| fork：gzip bundle（当前） | **~4.3 s** | **2 次 HTTP** | **5.7 MiB** |
+| fork：gzip bundle（当前） | **3.7–4.3 s** | **2 次 HTTP** | **5.7 MiB** |
 | fork：热启动（IDB 已有） | ~5.6 s | 3 次 HTTP | ~0.25 MiB |
 
-- 冷启动 4.25 s 出提示符，4.77 s 完成 `md5sum /bin/bash`；bundle 下载
-  1.3 s，与 WASM 编译完全重叠。
+- 冷启动 3.7–4.3 s 出提示符（两次独立测量），再 ~0.5 s 完成
+  `md5sum /bin/bash`；bundle 下载 1.0–1.3 s，与 WASM 编译完全重叠。
 - 热启动不取 bundle，只对 profile 内本次未缓存的 2 个块发 range 请求
   （预取器按字节数自动选路径的直接体现）。
 - 交互延迟：warm 串行 128 KiB 读 p50 ≈ 120 ms（NRT→KIX 一跳）vs 官方
@@ -203,9 +208,10 @@ Worker 动态路由、按 `Accept-Encoding` 协商返回 `Content-Encoding: zstd
 - DO 不驻留的 colo 有一跳骨干网延迟（`apt` 慢 ~2.7 s）；无法在免费套餐
   内消除，可观察 Cloudflare 扩 DO colo 覆盖。
 - 磁盘只读共享 + IndexedDB 本地写层，与上游一致；未做多镜像管理 UI。
-- `DEBUG_ENDPOINTS=1` 当前开启（profile 导出依赖它），生产可置 0。
-- 未来：bundle 的 zstd 内容编码协商；`bootblocks.json` 随镜像版本自动
-  失效清理。
+- 客户端预取依赖 CheerpX 私有的 IndexedDB 布局（`cjFS_/<id>/`）判断已缓
+  存块；CheerpX 升级若改布局，仅退化为「当作全冷、多下一次 bundle」，不
+  影响正确性。
+- 未来：bundle 的 zstd 内容编码协商；镜像更新后自动重录/导出 profile。
 
 ## 8. 变更文件清单
 
@@ -235,8 +241,11 @@ Worker 动态路由、按 `Accept-Encoding` 协商返回 `Content-Encoding: zstd
 npm run build:cloudflare-worker
 cd workers/disk-worker && npx wrangler deploy
 
+# 设置调试 token（一次性；profile 导出依赖 /debug/ 端点）
+cd workers/disk-worker && npx wrangler secret put DEBUG_TOKEN
+
 # 更新启动 profile 与 bundle（先真实启动一次让 DO 录制）
-node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2
+DEBUG_TOKEN=... node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2
 npx wrangler deploy
 
 # 协议回归

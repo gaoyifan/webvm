@@ -19,11 +19,11 @@
 	"migrations": [
 		{ "tag": "v1", "new_sqlite_classes": ["DiskSession"] }
 	],
+	// /debug/* endpoints require the DEBUG_TOKEN secret
+	// (`wrangler secret put DEBUG_TOKEN`) sent as `Authorization: Bearer`.
+	// Without the secret they are disabled.
 	"vars": {
-		"MAX_RANGE_BYTES": "8388608",
-		// Unauthenticated test/inspection endpoints under /debug/*. Set to "0"
-		// (or remove) for production deployments.
-		"DEBUG_ENDPOINTS": "1"
+		"MAX_RANGE_BYTES": "8388608"
 	},
 	"observability": {
 		"enabled": true

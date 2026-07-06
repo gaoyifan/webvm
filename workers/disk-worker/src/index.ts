@@ -29,10 +29,9 @@
  *    budget that a single long WebSocket invocation would get at the edge.
  *
  * The DO keeps an in-memory chunk cache, so warm reads cost one client<->DO
- * round trip. Cold reads (asset fetches, 500-900 ms) are hidden by two
- * read-ahead mechanisms: sequential prefetch behind the current read, and a
- * recorded boot profile (the deterministic first-touch chunk order) that is
- * prewarmed ahead of the client's position during boot.
+ * round trip. Cold reads (asset fetches, 500-900 ms) are hidden by
+ * sequential prefetch behind the current read. Boot reads rarely reach the
+ * DO at all: the frontend bulk-loads them from the boot-profile assets.
  */
 import { DurableObject } from "cloudflare:workers";
 
@@ -40,9 +39,9 @@ export interface Env {
 	ASSETS: Fetcher;
 	DISK_SESSIONS: DurableObjectNamespace<DiskSession>;
 	MAX_RANGE_BYTES?: string;
-	// Set to "1" to expose /debug/* endpoints (unauthenticated; disable in
-	// production deployments).
-	DEBUG_ENDPOINTS?: string;
+	// Secret gating the /debug/* endpoints (`wrangler secret put DEBUG_TOKEN`).
+	// Unset = debug endpoints disabled.
+	DEBUG_TOKEN?: string;
 }
 
 type DiskManifest = {
@@ -71,33 +70,17 @@ const CHUNK_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const PREFETCH_CHUNKS = 4;
 
 // Boot profile: the boot read sequence is deterministic for a given image,
-// so the DO records the first-touch order of 128 KiB blocks once. It serves
-// two consumers:
-//  - the frontend fetches it (as the bootblocks.json asset) and bulk-loads
-//    the blocks missing from its local cache — one gzipped bundle asset on a
-//    cold cache, a few parallel HTTP range reads on a warm-ish one —
-//    replacing ~150 serial WebSocket round trips during boot
-//  - the DO prewarms its chunk cache along the derived chunk order, keeping
-//    a bounded window ahead of the client's position, so reads that do go
-//    to the server (no asset shipped yet, prefetch misses) stay RTT-bound
-//    instead of paying the 500-900 ms cold asset fetch
-//
-// The profile ships as a static asset (/disks/<image>/bootblocks.json,
-// exported with scripts/export-boot-profile.mjs) so every colo and client
-// has it from the start. Without the asset, the DO records the profile from
-// the first session whose reads start at block 0 and persists it to DO
-// storage.
+// so the DO records the first-touch order of 128 KiB blocks once and
+// persists it to DO storage. scripts/export-boot-profile.mjs turns the
+// recording into static assets (bootblocks.json + a gzipped bundle of the
+// blocks) that the frontend bulk-loads at startup, replacing ~150 serial
+// WebSocket round trips during boot.
 const BOOT_BLOCK_BYTES = 128 * 1024;
 const PROFILE_MAX_ENTRIES = 768;
 const PROFILE_PERSIST_EVERY = 16;
 // A recorded profile is worth freezing once it covers a plausible boot set.
 const PROFILE_COMPLETE_MIN_ENTRIES = 24;
 const PROFILE_STORAGE_KEY = "bootProfile";
-// Prewarm pacing: cap concurrent asset reads so prewarming never starves
-// client-requested blocks, and stay within the per-invocation budget.
-const PREWARM_ON_CONNECT = 8;
-const PREWARM_PER_MESSAGE = 4;
-const PREWARM_LOOKAHEAD_CHUNKS = 32;
 
 // ---------------------------------------------------------------------------
 // Edge Worker: forwards disk WebSockets to the Durable Object, serves the
@@ -108,7 +91,7 @@ export default {
 	async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname.startsWith("/debug/")) {
-			if (env.DEBUG_ENDPOINTS !== "1") {
+			if (!env.DEBUG_TOKEN || request.headers.get("Authorization") !== `Bearer ${env.DEBUG_TOKEN}`) {
 				return new Response("Not found", { status: 404 });
 			}
 			return handleDebug(request, env, url);
@@ -192,19 +175,12 @@ export class DiskSession extends DurableObject<Env> {
 	private maxRangeBytes: number;
 	// Boot profile state. `profile` is the recorded first-touch order of
 	// 128 KiB blocks; `profileIndex` gives O(1) dedup and position lookup.
-	// `chunkOrder` is the derived first-touch chunk order used for prewarm.
 	private profile: number[] = [];
 	private profileIndex = new Map<number, number>();
-	private chunkOrder: number[] = [];
-	private chunkPos = new Map<number, number>();
 	private profileComplete = false;
 	private profileDirty = 0;
 	private profileLoaded?: Promise<void>;
 	private recording = false;
-	// How far into the chunk order the cache has been prewarmed. In-memory
-	// only: after a hibernation wake-up it is recomputed from the client's
-	// position.
-	private prewarmPos = 0;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -231,7 +207,6 @@ export class DiskSession extends DurableObject<Env> {
 		// Survives hibernation: image name and boot-profile recording state.
 		server.serializeAttachment({ imageName, recorder: false, sawFirst: false } satisfies SocketAttachment);
 		server.send(`${manifest.size}-${Math.floor(manifestLastModified(manifest).getTime() / 1000)}`);
-		this.prewarm(PREWARM_ON_CONNECT);
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
@@ -279,7 +254,6 @@ export class DiskSession extends DurableObject<Env> {
 		}
 
 		this.prefetchSequential(manifest, range.end);
-		this.advancePrewarm(manifest, range);
 	}
 
 	async webSocketClose(ws: WebSocket): Promise<void> {
@@ -390,7 +364,7 @@ export class DiskSession extends DurableObject<Env> {
 		if (response.ok) {
 			const shipped = (await response.json()) as { imageCreatedAt?: string; blocks?: number[] };
 			if (shipped.imageCreatedAt === manifest.createdAt && Array.isArray(shipped.blocks)) {
-				this.adoptProfile(shipped.blocks, true, manifest);
+				this.adoptProfile(shipped.blocks, true);
 				return;
 			}
 		} else {
@@ -399,25 +373,14 @@ export class DiskSession extends DurableObject<Env> {
 
 		const stored = await this.ctx.storage.get<{ blocks?: number[]; complete: boolean }>(PROFILE_STORAGE_KEY);
 		if (stored?.blocks && this.profile.length === 0) {
-			this.adoptProfile(stored.blocks, stored.complete, manifest);
+			this.adoptProfile(stored.blocks, stored.complete);
 		}
 	}
 
-	private adoptProfile(blocks: number[], complete: boolean, manifest: DiskManifest): void {
+	private adoptProfile(blocks: number[], complete: boolean): void {
 		this.profile = blocks.slice(0, PROFILE_MAX_ENTRIES);
 		this.profileComplete = complete;
 		this.profileIndex = new Map(this.profile.map((block, i) => [block, i]));
-		// Derive the first-touch chunk order for cache prewarming.
-		const blocksPerChunk = Math.max(1, Math.floor(manifest.chunkSize / BOOT_BLOCK_BYTES));
-		this.chunkOrder = [];
-		this.chunkPos = new Map();
-		for (const block of this.profile) {
-			const chunkIndex = Math.floor(block / blocksPerChunk);
-			if (!this.chunkPos.has(chunkIndex)) {
-				this.chunkPos.set(chunkIndex, this.chunkOrder.length);
-				this.chunkOrder.push(chunkIndex);
-			}
-		}
 	}
 
 	private recordAccess(attachment: SocketAttachment, blockIndex: number): void {
@@ -477,38 +440,6 @@ export class DiskSession extends DurableObject<Env> {
 			.catch(() => {});
 	}
 
-	/**
-	 * Keep the chunk cache warm along the recorded boot path, staying a
-	 * bounded window ahead of the client's current position in it.
-	 */
-	private advancePrewarm(manifest: DiskManifest, range: ByteRange): void {
-		const pos = this.chunkPos.get(Math.floor(range.start / manifest.chunkSize));
-		if (pos === undefined) {
-			return;
-		}
-		if (this.prewarmPos < pos + 1) {
-			this.prewarmPos = pos + 1;
-		}
-		const target = Math.min(pos + PREWARM_LOOKAHEAD_CHUNKS, this.chunkOrder.length);
-		if (this.prewarmPos < target) {
-			this.prewarm(PREWARM_PER_MESSAGE, target);
-		}
-	}
-
-	private prewarm(maxReads: number, targetPos?: number): void {
-		const limit = Math.min(targetPos ?? this.prewarmPos + maxReads, this.chunkOrder.length);
-		let started = 0;
-		while (this.prewarmPos < limit && started < maxReads) {
-			const chunkIndex = this.chunkOrder[this.prewarmPos++];
-			if (this.chunkCache.has(chunkIndex)) {
-				continue;
-			}
-			// Out-of-range profile entries 404 and are swallowed here.
-			void this.readChunk(chunkIndex).catch(() => {});
-			started++;
-		}
-	}
-
 	// ---- debug RPCs ----------------------------------------------------------
 
 	async debugStats(): Promise<Record<string, unknown>> {
@@ -529,8 +460,6 @@ export class DiskSession extends DurableObject<Env> {
 	async debugResetProfile(): Promise<void> {
 		this.profile = [];
 		this.profileIndex.clear();
-		this.chunkOrder = [];
-		this.chunkPos.clear();
 		this.profileComplete = false;
 		this.profileDirty = 0;
 		this.recording = false;
@@ -538,11 +467,7 @@ export class DiskSession extends DurableObject<Env> {
 	}
 
 	async debugSetProfile(blocks: number[]): Promise<void> {
-		const imageName = this.ctx.id.name?.split("@")[0];
-		if (!imageName) {
-			throw new Error("DO has no named id");
-		}
-		this.adoptProfile(blocks, true, await this.getManifest(imageName));
+		this.adoptProfile(blocks, true);
 		this.recording = false;
 		this.profileDirty = 0;
 		await this.ctx.storage.put(PROFILE_STORAGE_KEY, { blocks: this.profile, complete: true });
@@ -772,7 +697,7 @@ function corsHeaders(): Record<string, string> {
 }
 
 // ---------------------------------------------------------------------------
-// Debug endpoints (gated by DEBUG_ENDPOINTS=1).
+// Debug endpoints (gated by the DEBUG_TOKEN secret).
 // ---------------------------------------------------------------------------
 
 async function handleDebug(request: Request, env: Env, url: URL): Promise<Response> {

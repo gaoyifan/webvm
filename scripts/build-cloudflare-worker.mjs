@@ -70,12 +70,15 @@ async function stripExternalReferences() {
 async function writeAssetHeaders() {
 	// CheerpX needs cross-origin isolation (SharedArrayBuffer). Static assets
 	// are served without invoking the Worker, so the headers must come from
-	// the _headers file.
+	// the _headers file. Boot bundles have versioned filenames, so they can
+	// be cached forever.
 	const headers = [
 		"/*",
 		"  Cross-Origin-Embedder-Policy: require-corp",
 		"  Cross-Origin-Opener-Policy: same-origin",
 		"  Cross-Origin-Resource-Policy: cross-origin",
+		"/disks/:image/bundles/:bundle",
+		"  Cache-Control: public, max-age=31536000, immutable",
 		"",
 	].join("\n");
 	await fs.writeFile(path.join(assetsDir, "_headers"), headers);

@@ -11,3 +11,4 @@ workers/disk-worker/.wrangler/
 workers/disk-worker/.cheerpx-mirror/
 workers/disk-worker/worker-configuration.d.ts
 .playwright-cli/
+workers/disk-worker/.dev.vars

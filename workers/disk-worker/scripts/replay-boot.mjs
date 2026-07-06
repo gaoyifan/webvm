@@ -11,7 +11,11 @@ let chunks;
 if (chunksFile) {
 	chunks = JSON.parse(readFileSync(chunksFile, "utf8"));
 } else {
-	const stats = await (await fetch(`https://${host}/debug/session?image=${image}`)).json();
+	const stats = await (
+		await fetch(`https://${host}/debug/session?image=${image}`, {
+			headers: { Authorization: `Bearer ${process.env.DEBUG_TOKEN ?? ""}` },
+		})
+	).json();
 	chunks = stats.profile;
 	if (!chunks?.length) {
 		throw new Error("no profile recorded; pass a chunks JSON file");

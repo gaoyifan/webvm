@@ -26,9 +26,14 @@ const BLOCK_BYTES = 131072;
 // fewer requests (gap 2 => ~30 requests / ~1 MiB waste for the Debian boot).
 const COALESCE_GAP_BLOCKS = 2;
 const MAX_RANGE_BYTES = 8 * 1024 * 1024;
-// How long a block read may wait on the bulk fetch before falling back to
-// the server.
-const LOOKUP_TIMEOUT_MS = 10000;
+// A block read waiting on the bulk fetch falls back to the server when the
+// fetch stops making progress (stall), not on total duration, so slow links
+// that are still moving keep the single-download path.
+const STALL_TIMEOUT_MS = 15000;
+const LOOKUP_MAX_WAIT_MS = 120000;
+// Blocks CheerpX never asked for are dropped this long after the last bulk
+// fetch settles, so an imperfect profile cannot pin memory forever.
+const SWEEP_DELAY_MS = 120000;
 
 export function createBootPrefetcher(wsUrl, cacheId) {
 	const url = new URL(wsUrl, globalThis.location.href);
@@ -41,6 +46,26 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 	// blockIndex -> Promise settling when its bulk fetch lands.
 	const pending = new Map();
 	let imageSize = Infinity;
+	// Timestamp of the last byte of bulk-fetch progress, for stall detection.
+	let lastProgress = Date.now();
+	let sweepTimer = 0;
+
+	function markProgress() {
+		lastProgress = Date.now();
+	}
+
+	/** Drops unserved blocks a while after all bulk fetches settle. */
+	function maybeScheduleSweep() {
+		if (pending.size > 0) {
+			return;
+		}
+		clearTimeout(sweepTimer);
+		sweepTimer = setTimeout(() => {
+			if (pending.size === 0) {
+				blocks.clear();
+			}
+		}, SWEEP_DELAY_MS);
+	}
 
 	// Never rejects; on failure no blocks are registered and every lookup
 	// falls through to the server.
@@ -90,6 +115,7 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 			pending.set(block, settled);
 		}
 		const finishBlock = (block, data) => {
+			markProgress();
 			const resolve = resolvers.get(block);
 			if (!resolve) {
 				return; // Already cached in IDB; the client never asks for it.
@@ -100,12 +126,14 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 			resolve();
 		};
 
+		markProgress();
 		(async () => {
 			try {
 				const response = await fetch(`${httpOrigin}/disks/${encodeURIComponent(imageName)}/${profile.bundle}`);
 				if (!response.ok || !response.body) {
 					throw new Error(`no bundle (${response.status})`);
 				}
+				markProgress();
 				for await (const { block, data } of inflatedBlocks(response.body, profile, imageSize)) {
 					finishBlock(block, data);
 					if (resolvers.size === 0) {
@@ -126,10 +154,12 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 				resolvers.delete(block);
 				resolve();
 			}
+			maybeScheduleSweep();
 		})();
 	}
 
 	function fetchMissing(missing) {
+		markProgress();
 		for (const range of coalesce(missing)) {
 			const startByte = range.first * BLOCK_BYTES;
 			const endByte = Math.min((range.last + 1) * BLOCK_BYTES, imageSize) - 1;
@@ -142,10 +172,13 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 						return;
 					}
 					const data = new Uint8Array(await response.arrayBuffer());
+					markProgress();
 					for (let block = range.first; block <= range.last; block++) {
 						const offset = block * BLOCK_BYTES - startByte;
 						if (offset < data.byteLength) {
-							blocks.set(block, data.subarray(offset, Math.min(offset + BLOCK_BYTES, data.byteLength)));
+							// Copy out of the range buffer so a served (and
+							// freed) neighbor cannot pin the whole response.
+							blocks.set(block, data.slice(offset, Math.min(offset + BLOCK_BYTES, data.byteLength)));
 						}
 					}
 				} catch {
@@ -154,6 +187,7 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 					for (let block = range.first; block <= range.last; block++) {
 						pending.delete(block);
 					}
+					maybeScheduleSweep();
 				}
 			})();
 			for (let block = range.first; block <= range.last; block++) {
@@ -180,6 +214,7 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 			// Loop: when the bundle download fails mid-boot its blocks are
 			// handed over to freshly registered range fetches, so a settled
 			// wait may leave a block pending again under a new promise.
+			const waitStart = Date.now();
 			for (;;) {
 				const waits = [];
 				for (let block = firstBlock; block <= lastBlock; block++) {
@@ -191,7 +226,7 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 				if (waits.length === 0) {
 					break;
 				}
-				await withTimeout(Promise.all(waits), LOOKUP_TIMEOUT_MS);
+				await waitWhileProgressing(Promise.all(waits), waitStart);
 			}
 
 			const output = new Uint8Array(effectiveEnd - start + 1);
@@ -224,7 +259,32 @@ export function createBootPrefetcher(wsUrl, cacheId) {
 		}
 	}
 
+	/**
+	 * Waits for `settled`, giving up (throwing) only when the bulk fetch has
+	 * stalled for STALL_TIMEOUT_MS or the absolute cap is exceeded — a slow
+	 * but progressing download keeps waiters attached.
+	 */
+	async function waitWhileProgressing(settled, waitStart) {
+		const resolved = settled.then(() => true);
+		for (;;) {
+			const done = await Promise.race([resolved, delay(1000).then(() => false)]);
+			if (done) {
+				return;
+			}
+			if (Date.now() - lastProgress > STALL_TIMEOUT_MS) {
+				throw new Error("prefetch stalled");
+			}
+			if (Date.now() - waitStart > LOOKUP_MAX_WAIT_MS) {
+				throw new Error("prefetch too slow");
+			}
+		}
+	}
+
 	return { lookup };
+}
+
+function delay(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -381,20 +441,4 @@ async function readCachedBlockIndexes(cacheId, profile) {
 	} catch {
 		return empty;
 	}
-}
-
-function withTimeout(promise, ms) {
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => reject(new Error("prefetch timeout")), ms);
-		promise.then(
-			(value) => {
-				clearTimeout(timer);
-				resolve(value);
-			},
-			(error) => {
-				clearTimeout(timer);
-				reject(error);
-			},
-		);
-	});
 }

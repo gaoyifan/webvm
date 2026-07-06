@@ -15,7 +15,7 @@ Edge Worker ── forwards the WebSocket upgrade to the Durable Object
   ▼
 DiskSession Durable Object (one per image per colo)
   │            terminates the client WebSocket (Hibernation API)
-  │            chunk LRU (64 MiB) + boot-profile prewarm + prefetch
+  │            chunk LRU (64 MiB) + sequential prefetch
   │  fresh subrequest budget per message
   ▼
 Workers Static Assets: /disks/<image>.ext2/chunks/000123.bin (1 MiB each)
@@ -55,14 +55,12 @@ Workers Static Assets: /disks/<image>.ext2/chunks/000123.bin (1 MiB each)
   headless Chromium). Repeat visits skip the bulk fetch entirely (the
   IndexedDB cache already has the blocks).
 - **Sequential prefetch**: after each block read the DO prefetches the next
-  4 chunks into its cache.
-- **Boot-profile prewarm**: cold chunk reads cost 500–900 ms (asset fetch),
-  warm reads are client RTT. The DO derives the first-touch chunk order from
-  the same boot profile and prewarms its cache along it, staying ≤32 chunks
-  ahead of the client's position, so boot reads that do reach the server
-  (no bootblocks asset yet, prefetch misses) stay RTT-bound. Without the
-  shipped asset the DO records the profile from the first session whose
-  reads start at block 0 and persists it to DO storage.
+  4 chunks into its cache (cold chunk reads cost 500–900 ms, warm reads are
+  client RTT).
+- **Boot-profile recording**: the DO records the first-touch block order
+  from the first session whose reads start at block 0 and persists it to DO
+  storage; `scripts/export-boot-profile.mjs` turns that recording into the
+  shipped `bootblocks.json` + bundle assets.
 - **Error handling**: transient asset-read failures retry in-process, then
   fall back to the CloudDevice 1-byte reconnect signal. Malformed requests
   close the socket; reads past EOF are truncated exactly like the reference
@@ -153,21 +151,22 @@ node scripts/test-disk-endpoint.mjs \
 128 KiB reads and reports latency percentiles. `scripts/measure-boot.sh`
 measures browser time-to-prompt with playwright-cli.
 
-With `DEBUG_ENDPOINTS=1` (see `wrangler.jsonc`), the Worker exposes:
+The `/debug/*` endpoints require the `DEBUG_TOKEN` secret
+(`npx wrangler secret put DEBUG_TOKEN`; also put it in `.dev.vars` for
+`wrangler dev`) sent as `Authorization: Bearer <token>`. Without the secret
+they are disabled entirely:
 
 - `GET /debug/session?image=<image>` – DO cache/profile stats
 - `GET /debug/session?image=<image>&resetProfile` – clear the boot profile
-- `POST /debug/session?image=<image>&setProfile` (JSON array of chunk indexes)
+- `POST /debug/session?image=<image>&setProfile` (JSON array of block indexes)
 - `GET /debug/where` – edge colo vs DO colo and RPC latency
-
-Set `DEBUG_ENDPOINTS` to `"0"` for production.
 
 To ship the currently recorded boot profile as static assets
 (`bootblocks.json` + the gzipped boot bundle; enables the client boot
 prefetch and is available in every colo from the first boot):
 
 ```sh
-node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2
+DEBUG_TOKEN=... node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2
 npm run deploy
 ```
 

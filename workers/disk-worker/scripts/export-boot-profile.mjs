@@ -11,7 +11,7 @@
  *    it with the browser-native DecompressionStream.
  *
  * Usage:
- *   node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2
+ *   DEBUG_TOKEN=... node scripts/export-boot-profile.mjs --host <worker-host> --image <image>.ext2
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -25,12 +25,23 @@ const args = Object.fromEntries(
 );
 const host = args.host;
 const image = args.image;
-if (!host || !image) {
-	console.error("Usage: export-boot-profile.mjs --host <worker-host> --image <image>.ext2");
+const token = args.token ?? process.env.DEBUG_TOKEN;
+if (!host || !image || !token) {
+	console.error(
+		"Usage: export-boot-profile.mjs --host <worker-host> --image <image>.ext2 [--token <DEBUG_TOKEN>]\n" +
+			"The token must match the Worker's DEBUG_TOKEN secret (also read from $DEBUG_TOKEN).",
+	);
 	process.exit(1);
 }
 
-const stats = await (await fetch(`https://${host}/debug/session?image=${encodeURIComponent(image)}`)).json();
+const response = await fetch(`https://${host}/debug/session?image=${encodeURIComponent(image)}`, {
+	headers: { Authorization: `Bearer ${token}` },
+});
+if (!response.ok) {
+	console.error(`debug endpoint returned ${response.status}; check DEBUG_TOKEN`);
+	process.exit(1);
+}
+const stats = await response.json();
 if (!stats.profile?.length) {
 	console.error("No profile recorded on the server yet. Boot WebVM once, then retry.");
 	process.exit(1);
@@ -45,13 +56,11 @@ const bundleRaw = await concatBlocks(imageDir, manifest, blocks);
 const bundle = gzipSync(bundleRaw, { level: constants.Z_BEST_COMPRESSION });
 // Version the filename so a client can never pair a stale bundle with a
 // newer block list (deploys are atomic per file, not across files): a
-// mismatched fetch 404s and the client falls back to range requests.
-const bundleName = `bootbundle-${Date.now()}.bin.gz`;
-for (const entry of await fs.readdir(imageDir)) {
-	if (entry.startsWith("bootbundle-")) {
-		await fs.rm(path.join(imageDir, entry));
-	}
-}
+// mismatched fetch 404s and the client falls back to range requests. The
+// bundles/ directory gets immutable cache headers (see _headers).
+const bundleName = `bundles/bootbundle-${Date.now()}.bin.gz`;
+await fs.rm(path.join(imageDir, "bundles"), { recursive: true, force: true });
+await fs.mkdir(path.join(imageDir, "bundles"), { recursive: true });
 await fs.writeFile(path.join(imageDir, bundleName), bundle);
 
 const profile = {
