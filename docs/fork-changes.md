@@ -333,6 +333,44 @@ CheerpX 兼容性问题（版本越新触雷越多，buster/bullseye 不触）�
 升级到 bookworm/trixie 的前提是 CheerpX 修复上述仿真 bug（闭源，无法
 自行修）；届时用构建脚本重建即可。
 
+### 7.5 Alpine 终端镜像（非 GUI）评估
+
+官方 `alpine.html` 是带 Xorg/i3 的桌面版（`alpine_20251007.ext2`，
+`/sbin/init` + `needsDisplay`），与本次评估的**纯终端 Alpine**无关。
+`scripts/build-alpine-image.sh` 从官方 `alpine-minirootfs-<ver>-x86.tar.gz`
+构建终端镜像（`/bin/bash --login`、`needsDisplay: false`），包集合对齐
+`dockerfiles/debian_mini`（gcc/python3/node/ruby/vim/curl 等），并沿用
+Debian 镜像的 ext2 revision-0、`/dev` 清空、setuid sudo wrapper 做法。
+
+2026-07-07 在 CheerpX 1.3.0 上逐版本 E2E 实测（清空 IDB + HTTP 缓存，
+无 boot bundle；shell 提示符为 `:~$` 而非 `user@:~$`）：
+
+| Alpine | 冷启动 | python3 执行 | gcc | apk | CheerpX fault |
+| --- | --- | --- | --- | --- | --- |
+| 3.16.9 | 12.7 s | ✓ | ✓ | ✓ | 无 |
+| 3.18.12 | （未单独测，已构建） | — | — | — | — |
+| 3.20.10 | ✓ | ✓ | ✓ | ✓ | 无 |
+| 3.22.5 | 4.5 s | ✓（含 os.urandom） | ✓ | ✓ | 无 |
+| 3.23.5 | 7.7 s | ✓ | ✓ | ✓ | 无 |
+| **3.24.1** | 8.4 s | **✗ 挂死** | ✓ | ✓ | 有 |
+
+**最后兼容版本：Alpine 3.23.5。** 3.24.1 上 `python3 --version` 正常，
+但 `python3 -c 'print(1)'` 触发 CheerpX 指令级 fault 后进程不返回、
+可拖死整个 VM；gcc 编译运行与 `apk update` 仍正常。与 Debian 侧不同，
+Alpine（musl）未触发 libxcrypt/sudo 挂死，也不需要 getrandom 绕行。
+
+镜像约 1.2 GB / 1145 块。切换方式：
+
+```sh
+WEBVM_DISK_IMAGE=alpine_terminal_3.23.5.ext2 \
+WEBVM_DISK_SOURCE_URL=/path/to/alpine_3.23.5.ext2 \
+node scripts/build-cloudflare-worker.mjs
+cd workers/disk-worker && npx wrangler deploy
+```
+
+前端配置模板见 `config_cloudflare_alpine_terminal.js`；默认部署仍为
+bullseye。
+
 ## 8. 已知限制与未来工作
 
 - DO 不驻留的 colo 有一跳骨干网延迟（`apt` 慢 ~2.7 s）；无法在免费套餐
@@ -361,6 +399,9 @@ CheerpX 兼容性问题（版本越新触雷越多，buster/bullseye 不触）�
   `src/lib/cheerpx-self-hosted.js`、`src/lib/net-shim.js`
 - `scripts/build-cloudflare-worker.mjs`、`scripts/mirror-cheerpx.mjs`
 - `scripts/build-debian-image.sh`（bullseye/bookworm/trixie 镜像构建，见 §7）
+- `scripts/build-alpine-image.sh`（Alpine 终端镜像构建，见 §7.5）
+- `scripts/test-alpine-deploy.sh`（Alpine 镜像部署 + E2E 回归）
+- `config_cloudflare_alpine_terminal.js`（Alpine 终端前端配置模板）
 - `config_cloudflare_terminal.js`
 - `docs/fork-changes.md`（本文档）
 
