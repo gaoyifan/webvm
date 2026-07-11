@@ -20,6 +20,7 @@ await resetAssets();
 await run("npm", ["run", "build"], {
 	WEBVM_MODE: "cloudflare",
 	VITE_WEBVM_DISK_IMAGE: diskImageName,
+	...(process.env.ALPINE_DISK_IMAGE ? { VITE_ALPINE_DISK_IMAGE: process.env.ALPINE_DISK_IMAGE } : {}),
 });
 await fs.cp(path.join(rootDir, "build"), assetsDir, { recursive: true });
 await stripExternalReferences();
@@ -36,6 +37,23 @@ await run("npm", [
 	"--name",
 	diskImageName,
 ], diskSize ? { WEBVM_DISK_SIZE: diskSize } : {});
+
+// Secondary disk for /alpine-terminal.html (skipped if the image file is absent).
+const alpineImageName = process.env.ALPINE_DISK_IMAGE || "alpine_terminal_3.23.5.ext2";
+const alpineSource = process.env.ALPINE_DISK_SOURCE_URL || "/home/yifan/alpine-build/alpine_terminal_3.23.5.ext2";
+if (alpineSource !== diskSource && (await fs.stat(alpineSource).catch(() => null))) {
+	await run("npm", [
+		"--prefix",
+		workerDir,
+		"run",
+		"prepare:disk",
+		"--",
+		"--input",
+		alpineSource,
+		"--name",
+		alpineImageName,
+	]);
+}
 
 async function resetAssets() {
 	// Clear built frontend files but keep the (large, immutable) disk chunks;

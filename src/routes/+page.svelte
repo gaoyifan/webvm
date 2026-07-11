@@ -13,5 +13,5 @@ function handleProcessCreated(processCount)
 </script>
 
 <WebVM configObj={configObj} processCallback={handleProcessCreated} cacheId="blocks_terminal">
-	<p>Looking for a complete desktop experience? Try the new <a class="underline" href="/alpine.html" target="_blank">Alpine Linux</a> graphical WebVM</p>
+	<p>Looking for a complete desktop experience? Try the <a class="underline" href="/alpine.html" target="_blank">Alpine Linux</a> graphical WebVM, or a <a class="underline" href="/alpine-terminal.html" target="_blank">terminal-only Alpine</a> shell.</p>
 </WebVM>

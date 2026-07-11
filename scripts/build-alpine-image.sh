@@ -1,26 +1,68 @@
 #!/usr/bin/env bash
-# Builds an Alpine Linux x86 (i386) ext2 terminal image for WebVM.
+# Builds a minimal Alpine Linux x86 terminal image for WebVM (no GUI).
 #
-# Starts from the official alpine-minirootfs tarball (no Docker), installs a
-# mini package set similar to dockerfiles/debian_mini, and packs revision-0
-# ext2 the same way as build-debian-image.sh.
+# CheerpX 1.3.0: python3 execution breaks on Alpine 3.24+; pin 3.23.5
+# (see docs/fork-changes.md §7.5). Package set mirrors dockerfiles/debian_mini.
 #
-# Usage: sudo scripts/build-alpine-image.sh <version> <output.ext2> [size]
-#   version: e.g. 3.22.5 (must match a published minirootfs tag)
+# Usage: sudo scripts/build-alpine-image.sh [version] [output.ext2] [size]
+#   version defaults to 3.23.5
 set -euo pipefail
 
-VERSION=${1:?usage: build-alpine-image.sh <version> <output.ext2> [size bytes]}
-OUTPUT=${2:?usage: build-alpine-image.sh <version> <output.ext2> [size bytes]}
-SIZE=${3:-1200000000}
+# A failed cleanup must never expose the host /dev bind mount to rm. A private
+# mount namespace also prevents concurrent builds from propagating mounts into
+# one another.
+if [[ ${WEBVM_PRIVATE_MOUNT_NS_PID:-} != "$$" ]]; then
+	exec unshare --mount --propagation private -- env WEBVM_PRIVATE_MOUNT_NS_PID="$$" "$0" "$@"
+fi
+
+VERSION=${1:-3.23.5}
+OUTPUT=${2:-alpine_terminal_${VERSION}.ext2}
+SIZE=${3:-800000000}
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-MAJOR=${VERSION%.*}  # 3.22.5 -> 3.22
+MAJOR=${VERSION%.*}
 ROOTFS=$(mktemp -d /tmp/webvm-alpine-rootfs.XXXXXX)
+MOUNTS=()
+KEEP_ROOTFS=0
 TARBALL="alpine-minirootfs-${VERSION}-x86.tar.gz"
 URL="https://dl-cdn.alpinelinux.org/alpine/v${MAJOR}/releases/x86/${TARBALL}"
 
+has_rootfs_mounts() {
+	findmnt -rn -o TARGET | awk -v root="$ROOTFS" '
+		$0 == root || index($0, root "/") == 1 { found = 1 }
+		END { exit !found }
+	'
+}
+
 cleanup() {
-	umount "$ROOTFS/sys" "$ROOTFS/proc" "$ROOTFS/dev/pts" "$ROOTFS/dev" 2>/dev/null || true
-	rm -rf "$ROOTFS"
+	local status=$?
+	local i
+	local target
+	local unmount_failed=0
+	local resolved
+	trap - EXIT
+	set +e
+	for ((i = ${#MOUNTS[@]} - 1; i >= 0; i--)); do
+		target=${MOUNTS[i]}
+		if mountpoint -q "$target"; then
+			if ! umount "$target"; then
+				unmount_failed=1
+			fi
+		fi
+	done
+	if ((unmount_failed || KEEP_ROOTFS)) || has_rootfs_mounts; then
+		printf 'refusing to remove %s: a chroot mount could not be safely removed\n' "$ROOTFS" >&2
+		return 1
+	fi
+	resolved=$(realpath -e -- "$ROOTFS") || return 1
+	case "$resolved" in
+		/tmp/webvm-alpine-rootfs.*) ;;
+		*)
+			printf 'refusing to remove unexpected rootfs path: %s\n' "$resolved" >&2
+			return 1
+			;;
+	esac
+	rm -rf --one-file-system -- "$resolved"
+	return "$status"
 }
 trap cleanup EXIT
 
@@ -34,29 +76,24 @@ EOF
 cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
 
 mount --bind /dev "$ROOTFS/dev"
+MOUNTS+=("$ROOTFS/dev")
 mount -t devpts devpts "$ROOTFS/dev/pts"
+MOUNTS+=("$ROOTFS/dev/pts")
 mount -t proc proc "$ROOTFS/proc"
+MOUNTS+=("$ROOTFS/proc")
 mount --bind /sys "$ROOTFS/sys"
+MOUNTS+=("$ROOTFS/sys")
 
+# CLI-only set aligned with dockerfiles/debian_mini (no X11, no desktop).
 PACKAGES=(
-	bash ca-certificates curl gcc g++ git make nano vim less openssl
-	python3 py3-pip nodejs ruby netcat-openbsd
+	bash ca-certificates curl gcc musl-dev less make nano vim openssl
+	python3 nodejs ruby netcat-openbsd
 )
-BEST_EFFORT=(luajit lua5.4 cowsay)
-
 chroot "$ROOTFS" /sbin/apk add --no-cache "${PACKAGES[@]}"
-for pkg in "${BEST_EFFORT[@]}"; do
-	chroot "$ROOTFS" /sbin/apk add --no-cache "$pkg" || echo "skipped unavailable package: $pkg"
-done
-chroot "$ROOTFS" /sbin/apk cache clean 2>/dev/null || rm -rf "$ROOTFS/var/cache/apk"/*
+chroot "$ROOTFS" /sbin/apk add --no-cache luajit 2>/dev/null || echo "skipped: luajit"
+rm -rf "$ROOTFS/var/cache/apk"/*
 
-chroot "$ROOTFS" adduser -D -s /bin/bash user
-echo "user:password" | chroot "$ROOTFS" chpasswd
-echo "root:password" | chroot "$ROOTFS" chpasswd
-
-# Same setuid sudo wrapper as the Debian images (musl su may still hang).
 cat > "$ROOTFS/tmp/webvm-sudo.c" <<'EOC'
-/* Minimal sudo replacement for WebVM (see build-alpine-image.sh). */
 #include <stdio.h>
 #include <unistd.h>
 
@@ -83,6 +120,10 @@ chroot "$ROOTFS" chown root:root /usr/local/bin/sudo
 chroot "$ROOTFS" chmod 4755 /usr/local/bin/sudo
 rm -f "$ROOTFS/tmp/webvm-sudo.c"
 
+chroot "$ROOTFS" adduser -D -s /bin/bash user
+echo "user:password" | chroot "$ROOTFS" chpasswd
+echo "root:password" | chroot "$ROOTFS" chpasswd
+
 cp -r "$REPO_DIR/examples" "$ROOTFS/home/user/examples"
 chroot "$ROOTFS" chown -R user:user /home/user/examples
 chmod -R +x "$ROOTFS/home/user/examples/lua" 2>/dev/null || true
@@ -91,9 +132,20 @@ echo webvm > "$ROOTFS/etc/hostname"
 printf '127.0.0.1\tlocalhost webvm\n::1\tlocalhost ip6-localhost ip6-loopback\n' > "$ROOTFS/etc/hosts"
 printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' > "$ROOTFS/etc/resolv.conf"
 
-umount "$ROOTFS/sys" "$ROOTFS/proc" "$ROOTFS/dev/pts" "$ROOTFS/dev"
+for ((i = ${#MOUNTS[@]} - 1; i >= 0; i--)); do
+	if mountpoint -q "${MOUNTS[i]}" && ! umount "${MOUNTS[i]}"; then
+		KEEP_ROOTFS=1
+		exit 1
+	fi
+done
+MOUNTS=()
 
-rm -rf "$ROOTFS/dev"
+if has_rootfs_mounts; then
+	KEEP_ROOTFS=1
+	printf 'refusing to replace %s/dev: a chroot mount is still present\n' "$ROOTFS" >&2
+	exit 1
+fi
+rm -rf --one-file-system -- "${ROOTFS:?}/dev"
 mkdir -p "$ROOTFS/dev/pts" "$ROOTFS/dev/shm"
 touch "$ROOTFS/dev/console"
 

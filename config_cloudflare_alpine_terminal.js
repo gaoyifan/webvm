@@ -1,9 +1,11 @@
-const diskImageName = import.meta.env.VITE_WEBVM_DISK_IMAGE || "alpine_terminal_3.22.5.ext2";
+// Alpine terminal image (no GUI). Pinned to 3.23.5: last release where
+// python3 execution works under CheerpX 1.3.0 (3.24+ faults on python -c).
+const diskImageName = import.meta.env.VITE_ALPINE_DISK_IMAGE || "alpine_terminal_3.23.5.ext2";
 const defaultDiskImagePath = `/${diskImageName}`;
 const defaultDiskImageUrl = typeof location === "undefined" ? defaultDiskImagePath :
 	`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${defaultDiskImagePath}`;
 
-export const diskImageUrl = import.meta.env.VITE_WEBVM_DISK_URL || defaultDiskImageUrl;
+export const diskImageUrl = import.meta.env.VITE_ALPINE_DISK_URL || defaultDiskImageUrl;
 export const diskImageType = "cloud";
 export const printIntro = true;
 export const needsDisplay = false;

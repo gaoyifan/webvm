@@ -11,6 +11,13 @@
 # Usage: sudo scripts/build-debian-image.sh <release> <output.ext2> [size]
 set -euo pipefail
 
+# A failed cleanup must never expose the host /dev bind mount to rm. A private
+# mount namespace also prevents concurrent builds from propagating mounts into
+# one another.
+if [[ ${WEBVM_PRIVATE_MOUNT_NS_PID:-} != "$$" ]]; then
+	exec unshare --mount --propagation private -- env WEBVM_PRIVATE_MOUNT_NS_PID="$$" "$0" "$@"
+fi
+
 RELEASE=${1:?usage: build-debian-image.sh <release> <output.ext2> [size bytes]}
 OUTPUT=${2:?usage: build-debian-image.sh <release> <output.ext2> [size bytes]}
 # Newer package sets are a few hundred MiB larger than buster's; 2.4 GB
@@ -18,9 +25,46 @@ OUTPUT=${2:?usage: build-debian-image.sh <release> <output.ext2> [size bytes]}
 SIZE=${3:-2400000000}
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ROOTFS=$(mktemp -d /tmp/webvm-rootfs.XXXXXX)
+MOUNTS=()
+KEEP_ROOTFS=0
+
+has_rootfs_mounts() {
+	findmnt -rn -o TARGET | awk -v root="$ROOTFS" '
+		$0 == root || index($0, root "/") == 1 { found = 1 }
+		END { exit !found }
+	'
+}
+
 cleanup() {
-	umount "$ROOTFS/proc" "$ROOTFS/dev/pts" "$ROOTFS/dev" 2>/dev/null || true
-	rm -rf "$ROOTFS"
+	local status=$?
+	local i
+	local target
+	local unmount_failed=0
+	local resolved
+	trap - EXIT
+	set +e
+	for ((i = ${#MOUNTS[@]} - 1; i >= 0; i--)); do
+		target=${MOUNTS[i]}
+		if mountpoint -q "$target"; then
+			if ! umount "$target"; then
+				unmount_failed=1
+			fi
+		fi
+	done
+	if ((unmount_failed || KEEP_ROOTFS)) || has_rootfs_mounts; then
+		printf 'refusing to remove %s: a chroot mount could not be safely removed\n' "$ROOTFS" >&2
+		return 1
+	fi
+	resolved=$(realpath -e -- "$ROOTFS") || return 1
+	case "$resolved" in
+		/tmp/webvm-rootfs.*) ;;
+		*)
+			printf 'refusing to remove unexpected rootfs path: %s\n' "$resolved" >&2
+			return 1
+			;;
+	esac
+	rm -rf --one-file-system -- "$resolved"
+	return "$status"
 }
 trap cleanup EXIT
 
@@ -33,8 +77,11 @@ chmod 0755 "$ROOTFS"
 # the rootfs sits on a nodev mount), and a policy-rc.d that stops them from
 # starting services during install.
 mount --bind /dev "$ROOTFS/dev"
+MOUNTS+=("$ROOTFS/dev")
 mount -t devpts devpts "$ROOTFS/dev/pts"
+MOUNTS+=("$ROOTFS/dev/pts")
 mount -t proc proc "$ROOTFS/proc"
+MOUNTS+=("$ROOTFS/proc")
 printf '#!/bin/sh\nexit 101\n' > "$ROOTFS/usr/sbin/policy-rc.d"
 chmod +x "$ROOTFS/usr/sbin/policy-rc.d"
 
@@ -121,13 +168,24 @@ printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' > "$ROOTFS/etc/resolv.conf"
 
 # Unmount before the filesystem copy: the bind-mounted host /dev must not
 # leak into the image.
-umount "$ROOTFS/proc" "$ROOTFS/dev/pts" "$ROOTFS/dev"
+for ((i = ${#MOUNTS[@]} - 1; i >= 0; i--)); do
+	if mountpoint -q "${MOUNTS[i]}" && ! umount "${MOUNTS[i]}"; then
+		KEEP_ROOTFS=1
+		exit 1
+	fi
+done
+MOUNTS=()
 
 # CheerpX provides its own virtual /dev; real char-device nodes in the image
 # shadow it and block forever when opened (su/sudo hang on /dev/tty). The
 # upstream Docker-exported image has no device nodes either (docker cp
 # strips them) — just the mount-point dirs and an empty console file.
-rm -rf "$ROOTFS/dev"
+if has_rootfs_mounts; then
+	KEEP_ROOTFS=1
+	printf 'refusing to replace %s/dev: a chroot mount is still present\n' "$ROOTFS" >&2
+	exit 1
+fi
+rm -rf --one-file-system -- "${ROOTFS:?}/dev"
 mkdir -p "$ROOTFS/dev/pts" "$ROOTFS/dev/shm"
 touch "$ROOTFS/dev/console"
 

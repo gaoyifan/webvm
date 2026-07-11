@@ -354,22 +354,56 @@ Debian 镜像的 ext2 revision-0、`/dev` 清空、setuid sudo wrapper 做法。
 | 3.23.5 | 7.7 s | ✓ | ✓ | ✓ | 无 |
 | **3.24.1** | 8.4 s | **✗ 挂死** | ✓ | ✓ | 有 |
 
+**精简镜像（800 MB / 763 块，同包集）多轮实测**（2026-07-11，CheerpX
+1.3.0，清空 IDB + HTTP 缓存，无 boot bundle；每轮独立 browser context）：
+
+| Alpine | 成功轮次（秒） | median | 失败轮次 |
+| --- | --- | --- | --- |
+| 3.20.10 | 8.90, 7.34, 7.31, 6.99 | 7.32 s | 1 |
+| 3.21.7 | 12.38, 7.54, 7.61, 7.10, 7.41 | 7.54 s | 0 |
+| 3.22.5 | 12.22, 7.15, 7.17, 7.37 | 7.27 s | 1 |
+| **3.23.5** | 8.67, 7.39, 6.99, 7.05 | **7.22 s** | 1 |
+
+失败轮次均发生在刚部署后的前端静态资源 404，终端 DOM 未创建；它们是
+Worker 静态资产传播的一致性问题，不是 Alpine 启动超时，故单独计数而不混入
+耗时统计。首个成功轮次偶尔包含 CDN 边缘冷缓存成本，median 对其不敏感。
+
+**推荐默认：Alpine 3.23.5。** 四个版本的 median 差异只有 0.32 秒，属于
+网络与边缘缓存波动范围；3.23.5 同时是最新的完全兼容版本，且本轮 median
+反而最低。3.22.5 的旧 1.2 GB 单点 4.5 秒不能外推为精简镜像的稳定优势。
+
+3.22.5 与 3.23.5 的扩展兼容电池均通过：sudo、gcc 编译运行、Node、Ruby、
+LuaJIT、OpenSSL、`apk update` 与 `python3 -c`，浏览器 console 无 CheerpX
+fault。3.23.5 最终镜像的 WebSocket/HTTP range、跨 chunk、EOF 与本地 ext2
+逐字节校验也全部通过。
+
 **最后兼容版本：Alpine 3.23.5。** 3.24.1 上 `python3 --version` 正常，
 但 `python3 -c 'print(1)'` 触发 CheerpX 指令级 fault 后进程不返回、
 可拖死整个 VM；gcc 编译运行与 `apk update` 仍正常。与 Debian 侧不同，
 Alpine（musl）未触发 libxcrypt/sudo 挂死，也不需要 getrandom 绕行。
 
-镜像约 1.2 GB / 1145 块。切换方式：
+精简后镜像约 800 MB 分配 / 348 MB 已用 / 763 块。默认部署仍为 bullseye；
+Alpine 终端通过 `/alpine-terminal.html` 访问（`cacheId=blocks_alpine_terminal`）。
+`scripts/build-cloudflare-worker.mjs` 在本地存在
+`alpine_terminal_3.23.5.ext2` 时会自动附带该磁盘：
 
 ```sh
-WEBVM_DISK_IMAGE=alpine_terminal_3.23.5.ext2 \
-WEBVM_DISK_SOURCE_URL=/path/to/alpine_3.23.5.ext2 \
-node scripts/build-cloudflare-worker.mjs
+sudo scripts/build-alpine-image.sh   # 默认 3.23.5
+ALPINE_DISK_SOURCE_URL=/path/to/alpine_terminal_3.23.5.ext2 \
+  node scripts/build-cloudflare-worker.mjs
 cd workers/disk-worker && npx wrangler deploy
 ```
 
-前端配置模板见 `config_cloudflare_alpine_terminal.js`；默认部署仍为
-bullseye。
+前端配置见 `config_cloudflare_alpine_terminal.js`。
+
+构建脚本曾在四版本并发构建时因 `/dev` bind mount 卸载失败，EXIT trap 仍
+执行 `rm -rf "$ROOTFS"`，从而沿挂载点删除宿主 devtmpfs 中的设备节点；当次
+事故最终通过宿主重启恢复。现在 Alpine 与 Debian 构建均先进入独立 private
+mount namespace，仅逆序卸载本次成功挂载的目标；任何卸载失败或 rootfs 下
+残留挂载都会保留临时目录并报错。删除前还校验 `/tmp` 临时路径，并使用
+`rm --one-file-system`。修复后两个 Alpine 镜像并发构建及挂载期间 SIGTERM
+中断均通过，前后 `/dev/{null,zero,random,urandom,tty,ptmx}` 类型、权限和
+major/minor 未变化，也没有宿主可见的临时挂载残留。
 
 ## 8. 已知限制与未来工作
 
@@ -400,8 +434,10 @@ bullseye。
 - `scripts/build-cloudflare-worker.mjs`、`scripts/mirror-cheerpx.mjs`
 - `scripts/build-debian-image.sh`（bullseye/bookworm/trixie 镜像构建，见 §7）
 - `scripts/build-alpine-image.sh`（Alpine 终端镜像构建，见 §7.5）
+- `scripts/benchmark-alpine-boot.mjs`（多版本冷启动基准，见 §7.5）
 - `scripts/test-alpine-deploy.sh`（Alpine 镜像部署 + E2E 回归）
 - `config_cloudflare_alpine_terminal.js`（Alpine 终端前端配置模板）
+- `src/routes/alpine-terminal/`（`/alpine-terminal.html` 纯终端 Alpine 路由）
 - `config_cloudflare_terminal.js`
 - `docs/fork-changes.md`（本文档）
 
