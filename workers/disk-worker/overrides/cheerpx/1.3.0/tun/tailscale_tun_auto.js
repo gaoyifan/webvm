@@ -47,7 +47,7 @@ export async function autoConf({loginUrlCb, dnsIp, stateUpdateCb, netmapUpdateCb
 		}
 	};
 
-	
+
 	listeners.onloginurl = (login) => {
 		console.log("login url:",login);
 		loginUrlCb(login);
@@ -89,4 +89,3 @@ export async function autoConf({loginUrlCb, dnsIp, stateUpdateCb, netmapUpdateCb
 		},
 	}
 }
-

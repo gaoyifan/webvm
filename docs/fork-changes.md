@@ -206,8 +206,6 @@ HTTPS 全程 ~3.9 s。页面全程只访问 worker 域名 + Tailscale 基础设�
   96 MiB 顺序 soak（验证吞吐与零重连）。当前部署 18 项全过。
 - `export-boot-profile.mjs`：从 DO 调试端点导出录制的启动 profile，生成
   `bootblocks.json` 与 gzip bundle。
-- `replay-boot.mjs` / `measure-boot.sh`：串行重放启动读序列测延迟分位；
-  playwright 测浏览器 time-to-prompt。
 - 端到端验证用 playwright-cli 无头 Chromium：冷/热启动计时、
   `md5sum /bin/bash` 与官方 webvm.io 输出一致（字节级完整性）。
 
@@ -384,8 +382,8 @@ Alpine（musl）未触发 libxcrypt/sudo 挂死，也不需要 getrandom 绕行�
 
 精简后镜像约 800 MB 分配 / 348 MB 已用 / 763 块。默认部署仍为 bullseye；
 Alpine 终端通过 `/alpine-terminal.html` 访问（`cacheId=blocks_alpine_terminal`）。
-`scripts/build-cloudflare-worker.mjs` 在本地存在
-`alpine_terminal_3.23.5.ext2` 时会自动附带该磁盘：
+`scripts/build-cloudflare-worker.mjs` 要求显式提供 Alpine 磁盘源，避免部署
+成功后 `/alpine-terminal.html` 才因缺少镜像失败：
 
 ```sh
 sudo scripts/build-alpine-image.sh   # 默认 3.23.5
@@ -425,8 +423,8 @@ major/minor 未变化，也没有宿主可见的临时挂载残留。
 新增：
 
 - `workers/disk-worker/`：`src/index.ts`（edge + DO 全部服务端逻辑）、
-  `wrangler.jsonc`、`scripts/{prepare-disk,export-boot-profile,replay-boot,test-disk-endpoint}.mjs`、
-  `scripts/measure-boot.sh`、`README.md`
+  `wrangler.jsonc`、`scripts/{prepare-disk,export-boot-profile,test-disk-endpoint}.mjs`、
+  `README.md`
 - `workers/disk-worker/overrides/cheerpx/1.3.0/tun/`：
   `tailscale_tun.js`、`tailscale_tun_auto.js`（镜像时覆盖上游的 fork 补丁）
 - `src/lib/disk-ws-reconnect.js`、`src/lib/disk-boot-prefetch.js`、
@@ -435,7 +433,6 @@ major/minor 未变化，也没有宿主可见的临时挂载残留。
 - `scripts/build-debian-image.sh`（bullseye/bookworm/trixie 镜像构建，见 §7）
 - `scripts/build-alpine-image.sh`（Alpine 终端镜像构建，见 §7.5）
 - `scripts/benchmark-alpine-boot.mjs`（多版本冷启动基准，见 §7.5）
-- `scripts/test-alpine-deploy.sh`（Alpine 镜像部署 + E2E 回归）
 - `config_cloudflare_alpine_terminal.js`（Alpine 终端前端配置模板）
 - `src/routes/alpine-terminal/`（`/alpine-terminal.html` 纯终端 Alpine 路由）
 - `config_cloudflare_terminal.js`

@@ -11,16 +11,27 @@ const assetsDir = path.join(workerDir, "assets");
 // Locally built bullseye image (scripts/build-debian-image.sh); for images
 // not yet chunked into assets/, point WEBVM_DISK_SOURCE_URL at the .ext2.
 const diskImageName = process.env.WEBVM_DISK_IMAGE || "debian_bullseye_20260706_1.ext2";
-// Either a wss/https CloudDevice endpoint or a local .ext2 file path.
+// Either an HTTP/WebSocket CloudDevice endpoint or a local .ext2 file path.
 const diskSource = process.env.WEBVM_DISK_SOURCE_URL || `wss://disks.webvm.io/${diskImageName}`;
-const diskSourceIsLocal = !/^(https|wss):/.test(diskSource);
+const diskSourceIsLocal = !/^(https?|wss?):/.test(diskSource);
 const diskSize = process.env.WEBVM_DISK_SIZE;
+const alpineImageName = process.env.ALPINE_DISK_IMAGE || "alpine_terminal_3.23.5.ext2";
+const alpineSource = process.env.ALPINE_DISK_SOURCE_URL;
+const alpineSize = process.env.ALPINE_DISK_SIZE;
+
+if (!alpineSource) {
+	throw new Error("ALPINE_DISK_SOURCE_URL is required because /alpine-terminal.html is included in the build");
+}
+const alpineSourceIsLocal = !/^(https?|wss?):/.test(alpineSource);
+if (alpineSourceIsLocal) {
+	await fs.access(alpineSource);
+}
 
 await resetAssets();
 await run("npm", ["run", "build"], {
 	WEBVM_MODE: "cloudflare",
 	VITE_WEBVM_DISK_IMAGE: diskImageName,
-	...(process.env.ALPINE_DISK_IMAGE ? { VITE_ALPINE_DISK_IMAGE: process.env.ALPINE_DISK_IMAGE } : {}),
+	VITE_ALPINE_DISK_IMAGE: alpineImageName,
 });
 await fs.cp(path.join(rootDir, "build"), assetsDir, { recursive: true });
 await stripExternalReferences();
@@ -38,22 +49,17 @@ await run("npm", [
 	diskImageName,
 ], diskSize ? { WEBVM_DISK_SIZE: diskSize } : {});
 
-// Secondary disk for /alpine-terminal.html (skipped if the image file is absent).
-const alpineImageName = process.env.ALPINE_DISK_IMAGE || "alpine_terminal_3.23.5.ext2";
-const alpineSource = process.env.ALPINE_DISK_SOURCE_URL || "/home/yifan/alpine-build/alpine_terminal_3.23.5.ext2";
-if (alpineSource !== diskSource && (await fs.stat(alpineSource).catch(() => null))) {
-	await run("npm", [
-		"--prefix",
-		workerDir,
-		"run",
-		"prepare:disk",
-		"--",
-		"--input",
-		alpineSource,
-		"--name",
-		alpineImageName,
-	]);
-}
+await run("npm", [
+	"--prefix",
+	workerDir,
+	"run",
+	"prepare:disk",
+	"--",
+	alpineSourceIsLocal ? "--input" : "--source-url",
+	alpineSource,
+	"--name",
+	alpineImageName,
+], alpineSize ? { WEBVM_DISK_SIZE: alpineSize } : {});
 
 async function resetAssets() {
 	// Clear built frontend files but keep the (large, immutable) disk chunks;

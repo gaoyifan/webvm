@@ -57,11 +57,9 @@ export interface Env {
 }
 
 type DiskManifest = {
-	name: string;
 	size: number;
 	chunkSize: number;
 	chunks: number;
-	source?: string;
 	createdAt?: string;
 };
 
@@ -365,7 +363,7 @@ export class DiskSession extends DurableObject<Env> {
 		const nextChunk = Math.floor(rangeEnd / manifest.chunkSize) + 1;
 		const maxChunk = Math.min(manifest.chunks - 1, nextChunk + PREFETCH_CHUNKS - 1);
 		for (let chunkIndex = nextChunk; chunkIndex <= maxChunk; chunkIndex++) {
-			void this.readChunk(chunkIndex).catch(() => {});
+			this.ctx.waitUntil(this.readChunk(chunkIndex).catch(() => {}));
 		}
 	}
 
@@ -470,9 +468,11 @@ export class DiskSession extends DurableObject<Env> {
 			return;
 		}
 		this.profileDirty = 0;
-		void this.ctx.storage
-			.put(PROFILE_STORAGE_KEY, { blocks: this.profile, complete: this.profileComplete })
-			.catch(() => {});
+		this.ctx.waitUntil(
+			this.ctx.storage
+				.put(PROFILE_STORAGE_KEY, { blocks: this.profile, complete: this.profileComplete })
+				.catch(() => {}),
+		);
 	}
 
 	// ---- debug RPCs ----------------------------------------------------------

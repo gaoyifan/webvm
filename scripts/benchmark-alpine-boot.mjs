@@ -4,37 +4,26 @@
  * Usage:
  *   node scripts/benchmark-alpine-boot.mjs 3.20.10 3.22.5 3.23.5
  * Env:
- *   BENCH_ORIGIN   worker URL (default: cloudflare worker)
+ *   BENCH_ORIGIN   deployed worker URL (required)
+ *   ALPINE_BUILD_DIR  image and result directory (default: custom-disk-images)
  *   BENCH_RUNS     cold boots per version (default: 3)
  *   BENCH_ROUTE    /alpine-terminal.html or / (default: alpine-terminal)
  */
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
 
-const globalNodeModules = execFileSync("npm", ["root", "--global"], { encoding: "utf8" }).trim();
-const playwrightUrl = pathToFileURL(path.join(
-	globalNodeModules,
-	"@playwright",
-	"cli",
-	"node_modules",
-	"playwright",
-	"index.mjs",
-));
-const { chromium } = await import(playwrightUrl);
-
-const rootDir = process.env.WEBVM_ROOT
-	|| path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const buildDir = "/home/yifan/alpine-build";
-const ORIGIN = process.env.BENCH_ORIGIN
-	|| "https://webvm-disk-worker.d58993771361bc4ff2f5.workers.dev";
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const buildDir = process.env.ALPINE_BUILD_DIR || path.join(rootDir, "custom-disk-images");
+const ORIGIN = process.env.BENCH_ORIGIN;
 const RUNS = Number(process.env.BENCH_RUNS || 3);
 const ROUTE = process.env.BENCH_ROUTE || "/alpine-terminal.html";
 const TIMEOUT_MS = Number(process.env.BENCH_TIMEOUT_MS || 60_000);
 const versions = process.argv.slice(2);
-if (!versions.length) {
-	console.error("usage: benchmark-alpine-boot.mjs <ver> [ver ...]");
+if (!ORIGIN || !versions.length) {
+	console.error("usage: BENCH_ORIGIN=https://<worker-host> benchmark-alpine-boot.mjs <ver> [ver ...]");
 	process.exit(1);
 }
 
@@ -44,8 +33,7 @@ for (const ver of versions) {
 	const imageName = `alpine_terminal_${ver}.ext2`;
 	const ext2 = path.join(buildDir, imageName);
 	if (!(await fs.stat(ext2).catch(() => null))) {
-		console.error(`skip ${ver}: missing ${ext2}`);
-		continue;
+		throw new Error(`Missing Alpine image: ${ext2}`);
 	}
 
 	console.log(`\n=== ${ver}: prepare + deploy ===`);
@@ -60,7 +48,7 @@ for (const ver of versions) {
 	try {
 		for (let i = 0; i < RUNS; i++) {
 			try {
-				const bootS = await measureColdBoot(browser, `${ver}#${i + 1}`);
+				const bootS = await measureColdBoot(browser, `${ver}#${i + 1}`, i === 0);
 				times.push(bootS);
 				console.log(`  run ${i + 1}: ${bootS.toFixed(2)}s`);
 			} catch (error) {
@@ -97,6 +85,9 @@ if (successful.length) {
 const outputPath = path.join(buildDir, "boot-benchmark-results.json");
 await fs.writeFile(outputPath, `${JSON.stringify(results, null, 2)}\n`);
 console.log(`Results: ${outputPath}`);
+if (results.some((result) => result.failures > 0)) {
+	process.exitCode = 1;
+}
 
 async function runDeploy(ext2, imageName) {
 	const imageDir = path.join(rootDir, "workers", "disk-worker", "assets", "disks", imageName);
@@ -119,7 +110,7 @@ async function runDeploy(ext2, imageName) {
 	await run("npx", ["wrangler", "deploy"], { cwd: path.join(rootDir, "workers", "disk-worker") });
 }
 
-async function measureColdBoot(browser, label) {
+async function measureColdBoot(browser, label, verify) {
 	const context = await browser.newContext();
 	const page = await context.newPage();
 	const diagnostics = [];
@@ -148,13 +139,39 @@ async function measureColdBoot(browser, label) {
 			undefined,
 			{ timeout: TIMEOUT_MS },
 		);
-		return (Date.now() - t0) / 1000;
+		const bootSeconds = (Date.now() - t0) / 1000;
+		if (verify) {
+			await verifyAlpine(page);
+		}
+		return bootSeconds;
 	} catch (error) {
 		const tail = await page.locator("#console").innerText().catch(() => "");
 		error.message = `${label}: ${error.message}; console=${diagnostics.join(" | ")}; tail=${tail.slice(-500)}`;
 		throw error;
 	} finally {
 		await context.close();
+	}
+}
+
+async function verifyAlpine(page) {
+	await page.locator("#console").click();
+	await page.keyboard.type(
+		"python3 -c 'import os; print(os.urandom(4).hex())'; echo WEBVM_PY=$?; " +
+		"sudo whoami; echo WEBVM_SUDO=$?; " +
+		"gcc -o /tmp/webvm-hello examples/c/helloworld.c && /tmp/webvm-hello; echo WEBVM_GCC=$?; " +
+		"sudo apk update >/tmp/webvm-apk.log 2>&1; echo WEBVM_APK=$?",
+	);
+	await page.keyboard.press("Enter");
+	await page.waitForFunction(
+		() => /WEBVM_APK=\d/.test(document.getElementById("console")?.innerText ?? ""),
+		undefined,
+		{ timeout: 240_000 },
+	);
+	const output = await page.locator("#console").innerText();
+	for (const check of ["PY", "SUDO", "GCC", "APK"]) {
+		if (!output.includes(`WEBVM_${check}=0`)) {
+			throw new Error(`Alpine smoke check failed: ${check}`);
+		}
 	}
 }
 
@@ -166,5 +183,6 @@ function run(cmd, args, opts = {}) {
 			env: { ...process.env, ...opts.env },
 		});
 		child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exit ${code}`))));
+		child.on("error", reject);
 	});
 }

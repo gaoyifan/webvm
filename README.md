@@ -144,73 +144,25 @@ Then open `http://127.0.0.1:8081` and enjoy your local WebVM!
 
 ### Deploy with Cloudflare Workers Static Assets
 
-This fork includes `workers/disk-worker`, a Cloudflare Worker that serves ext2
-disk byte ranges through `CheerpX.CloudDevice`. It mirrors the official WebVM
-shape: WebVM connects to `wss://<worker-host>/<image>.ext2`, sends text ranges
-such as `0-131071`, and receives binary disk blocks. See
-[docs/fork-changes.md](docs/fork-changes.md) for a full description of how
-this fork differs from upstream (architecture, reliability, boot
-performance).
-
-For Cloudflare Workers Builds, connect this GitHub repository to the Worker in
-the Cloudflare dashboard and use:
+This fork includes a Cloudflare Worker that serves the frontend and chunked
+ext2 images from one origin. Build it with the Alpine terminal image that the
+included `/alpine-terminal.html` route requires:
 
 ```sh
-# Build command
-npm run build:cloudflare-worker
+ALPINE_DISK_SOURCE_URL=/path/to/alpine_terminal_3.23.5.ext2 \
+  npm run build:cloudflare-worker
 
-# Deploy command
 cd workers/disk-worker && npx wrangler deploy
 ```
 
-The build command downloads the official WebVM cloud disk in Cloudflare's build
-environment, splits it into 1 MiB Static Assets chunks, and copies the frontend
-build output into the Worker assets directory. Override the defaults with
-`WEBVM_DISK_IMAGE`, `WEBVM_DISK_SOURCE_URL`, and `WEBVM_DISK_SIZE` if needed.
-`WEBVM_DISK_DOWNLOAD_CONCURRENCY` and `WEBVM_DISK_DOWNLOAD_RETRIES` control the
-range downloader used during Workers Builds. For WebSocket sources, the build
-reads metadata from the WebSocket handshake and downloads chunks through HTTP
-ranges. `WEBVM_DISK_ASSET_CHUNK_SIZE` can be used to tune the deployed asset
-chunk size.
+`ALPINE_DISK_SOURCE_URL` may also be an HTTP or WebSocket disk endpoint. The
+default Debian image is `debian_bullseye_20260706_1.ext2`; override it with
+`WEBVM_DISK_IMAGE` and `WEBVM_DISK_SOURCE_URL`.
 
-The Worker uses Cloudflare Workers Static Assets. Because a full ext2 image is
-too large for a single static asset, prepare the disk as 1 MiB chunks:
-
-```sh
-cd workers/disk-worker
-npm install
-npm run prepare:disk -- \
-  --source-url wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2 \
-  --size 5044875331
-```
-
-You can also prepare chunks from a local ext2 image:
-
-```sh
-npm run prepare:disk -- --input ../../custom-disk-images/debian.ext2 --name debian.ext2
-```
-
-Run or deploy the Worker:
-
-```sh
-npm run dev
-npm run deploy
-```
-
-Build the WebVM frontend against the deployed Worker:
-
-```sh
-WEBVM_MODE=cloudflare \
-VITE_WEBVM_DISK_URL=wss://<worker-host>/<image>.ext2 \
-npm run build
-```
-
-If `VITE_WEBVM_DISK_URL` is omitted, the Cloudflare build uses the same host as
-the page and the default disk path `/debian_mini_20230519_5022088024.ext2`.
-Copy the frontend `build/` output into `workers/disk-worker/assets/` before
-deploying if you want one Worker to serve both WebVM and disk blocks.
-
-See `workers/disk-worker/README.md` for endpoint and verification details.
+See [workers/disk-worker/README.md](workers/disk-worker/README.md) for disk
+preparation, configuration, local testing, and deployment details. See
+[docs/fork-changes.md](docs/fork-changes.md) for the fork architecture and
+performance notes.
 
 ### Deploy to GitHub Pages
 

@@ -31,8 +31,6 @@ if (!imageName.endsWith(".ext2")) {
 const imageDir = path.join(assetsDir, "disks", imageName);
 const chunksDir = path.join(imageDir, "chunks");
 
-const source = args.input ?? args.sourceUrl;
-
 // The existing manifest is the source of truth for an already-chunked image:
 // skip before touching the source at all (locally built images have no
 // remote endpoint to query). Delete the image dir to force a re-chunk.
@@ -54,11 +52,9 @@ if (args.input) {
 }
 
 const manifest = {
-	name: imageName,
 	size,
 	chunkSize: CHUNK_SIZE,
 	chunks,
-	source,
 	createdAt: remoteInfo?.lastModified ? new Date(remoteInfo.lastModified * 1000).toISOString() : new Date().toISOString(),
 };
 
@@ -99,6 +95,11 @@ async function isAlreadyPrepared() {
 	const files = await fs.readdir(chunksDir).catch(() => []);
 	if (files.filter((name) => name.endsWith(".bin")).length !== manifest.chunks) {
 		return false;
+	}
+	if ("name" in manifest || "source" in manifest) {
+		delete manifest.name;
+		delete manifest.source;
+		await fs.writeFile(path.join(imageDir, "manifest.json"), `${JSON.stringify(manifest, null, "\t")}\n`);
 	}
 	console.log(`${imageName} already prepared (${manifest.chunks} chunks); skipping.`);
 	return true;

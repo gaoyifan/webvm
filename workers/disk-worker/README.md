@@ -109,10 +109,16 @@ and `WEBVM_DISK_ASSET_CHUNK_SIZE`.
 
 ```sh
 cd ../..
-npm run build:cloudflare-worker   # builds WebVM, copies build/ + _headers into assets/, downloads the disk
+ALPINE_DISK_SOURCE_URL=/path/to/alpine_terminal_3.23.5.ext2 \
+  npm run build:cloudflare-worker
 cd workers/disk-worker
 npm run deploy
 ```
+
+The source is required because the build always includes
+`/alpine-terminal.html`. It may be a local ext2 file or an HTTP/WebSocket disk
+endpoint. Set `ALPINE_DISK_IMAGE` to change its deployed filename and
+`ALPINE_DISK_SIZE` when using an HTTP source that does not report metadata.
 
 Or manually:
 
@@ -146,10 +152,6 @@ node scripts/test-disk-endpoint.mjs \
   --url wss://<worker-host>/<image>.ext2 \
   --reference /path/to/original.ext2        # omit --quick to include the soak
 ```
-
-`scripts/replay-boot.mjs` replays the recorded boot chunk order as serial
-128 KiB reads and reports latency percentiles. `scripts/measure-boot.sh`
-measures browser time-to-prompt with playwright-cli.
 
 The `/debug/*` endpoints require the `DEBUG_TOKEN` secret
 (`npx wrangler secret put DEBUG_TOKEN`; also put it in `.dev.vars` for
